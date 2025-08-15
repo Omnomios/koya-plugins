@@ -81,6 +81,9 @@ struct SignalItem {
 static std::atomic<uint32_t> g_nextId{1};
 static std::mutex g_promMutex;
 static std::unordered_map<uint32_t, PendingPromise> g_promises;
+// Map DBus reply serial -> our promise id for correct correlation
+static std::mutex g_serialMapMutex;
+static std::unordered_map<uint32_t, uint32_t> g_serialToPromiseId;
 static std::mutex g_replyMutex;
 static std::queue<ReplyItem> g_replies;
 static std::mutex g_sigMutex;
@@ -110,13 +113,15 @@ static void pump_loop() {
     while (g_running.load()) {
         DBusConnection* conn = g_conn;
         if (!conn) break;
+        // Poll for up to 50ms, then drain ALL available messages to avoid backlog-induced latency
         dbus_connection_read_write(conn, 50 /* ms */);
-        DBusMessage* msg = dbus_connection_pop_message(conn);
-        if (!msg) continue;
-        int type = dbus_message_get_type(msg);
+        for (;;) {
+            DBusMessage* msg = dbus_connection_pop_message(conn);
+            if (!msg) break;
+            int type = dbus_message_get_type(msg);
         if (type == DBUS_MESSAGE_TYPE_METHOD_RETURN || type == DBUS_MESSAGE_TYPE_ERROR) {
-            // Correlate via serial? For now, just push string body and let JS resolve latest
-            // Better: use pending call API, but keep simple initial version
+            // Correlate reply using DBus reply serial captured at send time
+            uint32_t reply_serial = dbus_message_get_reply_serial(msg);
             const char* errname = type == DBUS_MESSAGE_TYPE_ERROR ? dbus_message_get_error_name(msg) : nullptr;
             DBusMessageIter iter;
             dbus_message_iter_init(msg, &iter);
@@ -188,11 +193,15 @@ static void pump_loop() {
                     }
                 }
             }
-            // Deliver to latest promise if any
+            // Deliver to the matching promise if mapping exists
             uint32_t id = 0;
-            {
-                std::lock_guard<std::mutex> lk(g_promMutex);
-                if (!g_promises.empty()) id = g_promises.begin()->first;
+            if (reply_serial != 0) {
+                std::lock_guard<std::mutex> lk(g_serialMapMutex);
+                auto it = g_serialToPromiseId.find(reply_serial);
+                if (it != g_serialToPromiseId.end()) {
+                    id = it->second;
+                    g_serialToPromiseId.erase(it);
+                }
             }
             if (id != 0) {
                 std::lock_guard<std::mutex> lk(g_replyMutex);
@@ -215,6 +224,7 @@ static void pump_loop() {
             g_signals.push(std::move(si));
         }
             dbus_message_unref(msg);
+        }
     }
 }
 
@@ -300,10 +310,15 @@ static JSValue js_call(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
         std::lock_guard<std::mutex> lk(g_promMutex);
         g_promises.emplace(id, PendingPromise{ctx, resolve, reject});
     }
-    // Send message (no pending call API for now; pump_loop will push a reply)
-    dbus_connection_send(g_conn, msg, nullptr);
+    // Send message and capture serial so we can correlate the reply
+    uint32_t serial = 0;
+    dbus_connection_send(g_conn, msg, &serial);
     dbus_connection_flush(g_conn);
     dbus_message_unref(msg);
+    if (serial != 0) {
+        std::lock_guard<std::mutex> lk(g_serialMapMutex);
+        g_serialToPromiseId.emplace(serial, id);
+    }
     return promise;
 }
 
