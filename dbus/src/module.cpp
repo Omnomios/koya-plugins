@@ -68,7 +68,10 @@ struct PendingPromise {
 struct ReplyItem {
     uint32_t id;
     bool ok;
-    std::string payload; // string or JSON-encoded object
+    bool isJson = false;                // true if payload holds JSON to parse
+    bool isBytes = false;               // true when returning ay (array of bytes)
+    std::string payload;                // string or JSON-encoded object
+    std::vector<uint8_t> bytesPayload;  // for ay
 };
 
 // Result produced by the pump thread for a signal emission.
@@ -286,6 +289,41 @@ static void pump_loop() {
                 out = std::string("ERROR:") + errname;
             } else if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_INVALID) {
                 int argt = dbus_message_iter_get_arg_type(&iter);
+                // ay or variant(ay) → enqueue as bytesReply and continue
+                if ((argt == DBUS_TYPE_ARRAY && dbus_message_iter_get_element_type(&iter) == DBUS_TYPE_BYTE) || argt == DBUS_TYPE_VARIANT) {
+                    DBusMessageIter arrIt;
+                    if (argt == DBUS_TYPE_VARIANT) {
+                        DBusMessageIter sub; dbus_message_iter_recurse(&iter, &sub);
+                        if (dbus_message_iter_get_arg_type(&sub) == DBUS_TYPE_ARRAY && dbus_message_iter_get_element_type(&sub) == DBUS_TYPE_BYTE) {
+                            arrIt = sub;
+                        } else {
+                            goto not_bytes_path;
+                        }
+                    } else {
+                        arrIt = iter;
+                    }
+                    // Map reply id now
+                    uint32_t bid = 0;
+                    if (reply_serial != 0) {
+                        std::lock_guard<std::mutex> lk(g_serialMapMutex);
+                        auto it = g_serialToPromiseId.find(reply_serial);
+                        if (it != g_serialToPromiseId.end()) { bid = it->second; g_serialToPromiseId.erase(it); }
+                    }
+                    if (bid != 0) {
+                        DBusMessageIter sub2; dbus_message_iter_recurse(&arrIt, &sub2);
+                        ReplyItem ri; ri.id = bid; ri.ok = (errname == nullptr); ri.isBytes = true;
+                        while (dbus_message_iter_get_arg_type(&sub2) == DBUS_TYPE_BYTE) {
+                            unsigned int v = 0; dbus_message_iter_get_basic(&sub2, &v);
+                            ri.bytesPayload.push_back(static_cast<uint8_t>(v & 0xFF));
+                            dbus_message_iter_next(&sub2);
+                        }
+                        std::lock_guard<std::mutex> lk2(g_replyMutex);
+                        g_replies.push(std::move(ri));
+                        dbus_message_unref(msg);
+                        continue;
+                    }
+                }
+not_bytes_path:
                 // Simple basic types returned raw; composite types returned as JSON
                 if (argt == DBUS_TYPE_STRING || argt == DBUS_TYPE_OBJECT_PATH || argt == DBUS_TYPE_SIGNATURE ||
                     argt == DBUS_TYPE_BOOLEAN || argt == DBUS_TYPE_BYTE || argt == DBUS_TYPE_INT16 || argt == DBUS_TYPE_UINT16 ||
@@ -294,7 +332,7 @@ static void pump_loop() {
                     if (argt == DBUS_TYPE_STRING || argt == DBUS_TYPE_OBJECT_PATH || argt == DBUS_TYPE_SIGNATURE) {
                         const char* s = nullptr; dbus_message_iter_get_basic(&iter, &s); out = s ? s : "";
                     }
-                                } else {
+                } else {
                     std::string json; dbus_value_to_json(json, &iter); out = std::move(json);
                 }
             }
@@ -310,7 +348,11 @@ static void pump_loop() {
             }
             if (id != 0) {
                 std::lock_guard<std::mutex> lk(g_replyMutex);
-                g_replies.push(ReplyItem{id, errname == nullptr, std::move(out)});
+                ReplyItem ri; ri.id = id; ri.ok = (errname == nullptr);
+                // Mark composite replies as JSON (non-empty and starts with '{' or '[')
+                if (!out.empty() && (out[0] == '{' || out[0] == '[')) { ri.isJson = true; }
+                ri.payload = std::move(out);
+                g_replies.push(std::move(ri));
             }
             if (g_debug) {
                 fprintf(stderr, "dbus recv: reply_serial=%u -> id=%u ok=%d payload_len=%zu err=%s\n",
@@ -406,7 +448,8 @@ static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSVal
             if (!waiters.empty()) {
                 std::lock_guard<std::mutex> lk(g_replyMutex);
                 for (uint32_t wid : waiters) {
-                    g_replies.push(ReplyItem{wid, false, e});
+                    ReplyItem ri; ri.id = wid; ri.ok = false; ri.payload = e;
+                    g_replies.push(std::move(ri));
                 }
             }
             g_connecting.store(false);
@@ -432,7 +475,8 @@ static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSVal
         if (!waiters.empty()) {
             std::lock_guard<std::mutex> lk(g_replyMutex);
             for (uint32_t wid : waiters) {
-                g_replies.push(ReplyItem{wid, true, std::string()});
+                ReplyItem ri; ri.id = wid; ri.ok = true; ri.payload = std::string();
+                g_replies.push(std::move(ri));
             }
         }
         g_connecting.store(false);
@@ -635,7 +679,8 @@ static void dbus_update(void*) {
         for (auto it = g_promises.begin(); it != g_promises.end(); ) {
             const PendingPromise& p = it->second;
             if (p.timeoutMs > 0 && now - p.createdMs > p.timeoutMs) {
-                timedOut.push_back(ReplyItem{it->first, false, std::string("ERROR:timeout")});
+                ReplyItem ri; ri.id = it->first; ri.ok = false; ri.payload = std::string("ERROR:timeout");
+                timedOut.push_back(std::move(ri));
                 // Remove any serial mapping to this id
                 {
                     std::lock_guard<std::mutex> lk2(g_serialMapMutex);
@@ -665,9 +710,37 @@ static void dbus_update(void*) {
             if (it == g_promises.end()) continue;
             auto pend = it->second; g_promises.erase(it);
             if (r.ok) {
-                JSValue s = JS_NewString(g_ctx, r.payload.c_str());
-                JS_Call(g_ctx, pend.resolve, JS_UNDEFINED, 1, &s);
-                JS_FreeValue(g_ctx, s);
+                if (r.isBytes) {
+                    JSValue arr = JS_NewArray(g_ctx);
+                    uint32_t idx = 0;
+                    for (uint8_t b : r.bytesPayload) {
+                        JS_DefinePropertyValueUint32(
+                            g_ctx,
+                            arr,
+                            idx++,
+                            JS_NewInt32(g_ctx, (int)b),
+                            JS_PROP_C_W_E
+                        );
+                    }
+                    JS_Call(g_ctx, pend.resolve, JS_UNDEFINED, 1, &arr);
+                    JS_FreeValue(g_ctx, arr);
+                } else if (r.isJson) {
+                    JSValue jsonStr = JS_NewString(g_ctx, r.payload.c_str());
+                    JSValue global = JS_GetGlobalObject(g_ctx);
+                    JSValue jsonObj = JS_GetPropertyStr(g_ctx, global, "JSON");
+                    JSValue parseFn = JS_GetPropertyStr(g_ctx, jsonObj, "parse");
+                    JSValue parsed = JS_Call(g_ctx, parseFn, jsonObj, 1, &jsonStr);
+                    JS_FreeValue(g_ctx, parseFn);
+                    JS_FreeValue(g_ctx, jsonObj);
+                    JS_FreeValue(g_ctx, global);
+                    JS_FreeValue(g_ctx, jsonStr);
+                    JS_Call(g_ctx, pend.resolve, JS_UNDEFINED, 1, &parsed);
+                    JS_FreeValue(g_ctx, parsed);
+                } else {
+                    JSValue s = JS_NewString(g_ctx, r.payload.c_str());
+                    JS_Call(g_ctx, pend.resolve, JS_UNDEFINED, 1, &s);
+                    JS_FreeValue(g_ctx, s);
+                }
             } else {
                 JSValue s = JS_NewString(g_ctx, r.payload.c_str());
                 JS_Call(g_ctx, pend.reject, JS_UNDEFINED, 1, &s);
@@ -752,7 +825,8 @@ JSModuleDef* integrate(JSContext* ctx, const char* module_name, RegisterHookFunc
             if (!waiters.empty()) {
                 std::lock_guard<std::mutex> lk(g_replyMutex);
                 for (uint32_t wid : waiters) {
-                    g_replies.push(ReplyItem{wid, false, std::string("canceled")});
+                    ReplyItem ri; ri.id = wid; ri.ok = false; ri.payload = std::string("canceled");
+                    g_replies.push(std::move(ri));
                 }
             }
         }
