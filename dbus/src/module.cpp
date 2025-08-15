@@ -36,6 +36,7 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <chrono>
 #include <optional>
 #include <queue>
 #include <string>
@@ -59,6 +60,8 @@ struct PendingPromise {
     JSContext* ctx;
     JSValue resolve;
     JSValue reject;
+    uint64_t createdMs;
+    uint32_t timeoutMs;
 };
 
 // Result produced by the pump thread for a method return or error.
@@ -99,12 +102,164 @@ static std::atomic<bool> g_running{false};
 static std::atomic<bool> g_threadsInited{false};
 static DBusConnection* g_conn = nullptr;
 static BusType g_busType = BusType::Session;
+static std::atomic<bool> g_connecting{false};
+static std::mutex g_connectWaitersMutex;
+static std::vector<uint32_t> g_connectWaiterIds;
+// Serialize bus I/O between sender and pump to avoid reply-mapping race
+static std::mutex g_busIoMutex;
+static bool g_debug = false;
 
 static std::string js_to_string(JSContext* ctx, JSValueConst v) {
     const char* c = JS_ToCString(ctx, v);
     std::string s = c ? c : "";
     if (c) JS_FreeCString(ctx, c);
     return s;
+}
+
+// -------- DBus value stringification helpers --------
+static void json_append_escaped(std::string& out, const char* s) {
+    out.push_back('"');
+    for (const char* p = s ? s : ""; *p; ++p) {
+        unsigned char ch = (unsigned char)*p;
+        switch (ch) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (ch < 0x20) {
+                    char buf[7];
+                    snprintf(buf, sizeof(buf), "\\u%04x", ch);
+                    out += buf;
+                } else {
+                    out.push_back((char)ch);
+                }
+        }
+    }
+    out.push_back('"');
+}
+
+static std::string dbus_basic_to_string(int type, DBusMessageIter* it) {
+    switch (type) {
+        case DBUS_TYPE_STRING: {
+            const char* s; dbus_message_iter_get_basic(it, &s);
+            return s ? std::string(s) : std::string();
+        }
+        case DBUS_TYPE_OBJECT_PATH: {
+            const char* p; dbus_message_iter_get_basic(it, &p);
+            return p ? std::string(p) : std::string();
+        }
+        case DBUS_TYPE_BOOLEAN: {
+            dbus_bool_t b; dbus_message_iter_get_basic(it, &b);
+            return b ? "true" : "false";
+        }
+        case DBUS_TYPE_BYTE: { unsigned int v; dbus_message_iter_get_basic(it, &v); return std::to_string(v); }
+        case DBUS_TYPE_INT16: { int16_t v; dbus_message_iter_get_basic(it, &v); return std::to_string(v); }
+        case DBUS_TYPE_UINT16:{ uint16_t v; dbus_message_iter_get_basic(it, &v); return std::to_string(v); }
+        case DBUS_TYPE_INT32: { int32_t v; dbus_message_iter_get_basic(it, &v); return std::to_string(v); }
+        case DBUS_TYPE_UINT32:{ uint32_t v; dbus_message_iter_get_basic(it, &v); return std::to_string(v); }
+        case DBUS_TYPE_INT64: { long long v; dbus_message_iter_get_basic(it, &v); return std::to_string(v); }
+        case DBUS_TYPE_UINT64:{ unsigned long long v; dbus_message_iter_get_basic(it, &v); return std::to_string(v); }
+        case DBUS_TYPE_DOUBLE:{ double v; dbus_message_iter_get_basic(it, &v); char buf[64]; snprintf(buf,sizeof(buf),"%g",v); return std::string(buf); }
+        case DBUS_TYPE_SIGNATURE: {
+            const char* s; dbus_message_iter_get_basic(it, &s);
+            return s ? std::string(s) : std::string();
+        }
+        default: return std::string();
+    }
+}
+
+static void dbus_value_to_json(std::string& out, DBusMessageIter* it);
+
+static void dbus_array_to_json(std::string& out, DBusMessageIter* it) {
+    // it points to ARRAY
+    int elem = dbus_message_iter_get_element_type(it);
+    DBusMessageIter sub; dbus_message_iter_recurse(it, &sub);
+    if (elem == DBUS_TYPE_DICT_ENTRY) {
+        // a{sv}
+        out.push_back('{');
+        bool first = true;
+        while (dbus_message_iter_get_arg_type(&sub) == DBUS_TYPE_DICT_ENTRY) {
+            DBusMessageIter dict; dbus_message_iter_recurse(&sub, &dict);
+            const char* key = "";
+            if (dbus_message_iter_get_arg_type(&dict) == DBUS_TYPE_STRING) {
+                dbus_message_iter_get_basic(&dict, &key);
+                dbus_message_iter_next(&dict);
+            }
+            if (!first) out.push_back(','); first = false;
+            json_append_escaped(out, key ? key : "");
+            out.push_back(':');
+            if (dbus_message_iter_get_arg_type(&dict) == DBUS_TYPE_VARIANT) {
+                DBusMessageIter var; dbus_message_iter_recurse(&dict, &var);
+                dbus_value_to_json(out, &var);
+            } else {
+                out += "null";
+            }
+            dbus_message_iter_next(&sub);
+        }
+        out.push_back('}');
+    } else {
+        // Generic array → JSON array
+        out.push_back('[');
+        bool first = true;
+        while (dbus_message_iter_get_arg_type(&sub) != DBUS_TYPE_INVALID) {
+            if (!first) out.push_back(','); first = false;
+            dbus_value_to_json(out, &sub);
+            dbus_message_iter_next(&sub);
+        }
+        out.push_back(']');
+    }
+}
+
+static void dbus_struct_to_json(std::string& out, DBusMessageIter* it) {
+    // Represent struct as JSON array of its fields
+    DBusMessageIter sub; dbus_message_iter_recurse(it, &sub);
+    out.push_back('[');
+    bool first = true;
+    while (dbus_message_iter_get_arg_type(&sub) != DBUS_TYPE_INVALID) {
+        if (!first) out.push_back(','); first = false;
+        dbus_value_to_json(out, &sub);
+        dbus_message_iter_next(&sub);
+    }
+    out.push_back(']');
+}
+
+static void dbus_variant_to_json(std::string& out, DBusMessageIter* it) {
+    DBusMessageIter sub; dbus_message_iter_recurse(it, &sub);
+    dbus_value_to_json(out, &sub);
+}
+
+static void dbus_value_to_json(std::string& out, DBusMessageIter* it) {
+    int t = dbus_message_iter_get_arg_type(it);
+    if (t == DBUS_TYPE_ARRAY) {
+        dbus_array_to_json(out, it);
+        return;
+    }
+    if (t == DBUS_TYPE_STRUCT) {
+        dbus_struct_to_json(out, it);
+        return;
+    }
+    if (t == DBUS_TYPE_VARIANT) {
+        dbus_variant_to_json(out, it);
+        return;
+    }
+    // Basic types
+    if (t == DBUS_TYPE_STRING || t == DBUS_TYPE_OBJECT_PATH || t == DBUS_TYPE_SIGNATURE) {
+        const char* s = nullptr;
+        dbus_message_iter_get_basic(it, &s);
+        json_append_escaped(out, s ? s : "");
+        return;
+    }
+    std::string s = dbus_basic_to_string(t, it);
+    if (!s.empty()) { out += s; return; }
+    out += "null";
+}
+
+
+static uint64_t now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
 // Background I/O loop. Runs on g_pumpThread, pulls messages and enqueues
@@ -116,6 +271,7 @@ static void pump_loop() {
         // Poll for up to 50ms, then drain ALL available messages to avoid backlog-induced latency
         dbus_connection_read_write(conn, 50 /* ms */);
         for (;;) {
+            std::lock_guard<std::mutex> iolk(g_busIoMutex);
             DBusMessage* msg = dbus_connection_pop_message(conn);
             if (!msg) break;
             int type = dbus_message_get_type(msg);
@@ -130,67 +286,16 @@ static void pump_loop() {
                 out = std::string("ERROR:") + errname;
             } else if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_INVALID) {
                 int argt = dbus_message_iter_get_arg_type(&iter);
-                if (argt == DBUS_TYPE_STRING) {
-                    const char* s; dbus_message_iter_get_basic(&iter, &s); out = s ? s : "";
-                } else if (argt == DBUS_TYPE_VARIANT) {
-                    DBusMessageIter var;
-                    dbus_message_iter_recurse(&iter, &var);
-                    int vt = dbus_message_iter_get_arg_type(&var);
-                    if (vt == DBUS_TYPE_STRING) {
-                        const char* s; dbus_message_iter_get_basic(&var, &s); out = s ? s : "";
-                    } else if (vt == DBUS_TYPE_BOOLEAN) {
-                        dbus_bool_t b; dbus_message_iter_get_basic(&var, &b); out = b ? "true" : "false";
-                    } else if (vt == DBUS_TYPE_UINT32) {
-                        uint32_t u; dbus_message_iter_get_basic(&var, &u); out = std::to_string(u);
-                    } else if (vt == DBUS_TYPE_INT32) {
-                        int32_t i; dbus_message_iter_get_basic(&var, &i); out = std::to_string(i);
+                // Simple basic types returned raw; composite types returned as JSON
+                if (argt == DBUS_TYPE_STRING || argt == DBUS_TYPE_OBJECT_PATH || argt == DBUS_TYPE_SIGNATURE ||
+                    argt == DBUS_TYPE_BOOLEAN || argt == DBUS_TYPE_BYTE || argt == DBUS_TYPE_INT16 || argt == DBUS_TYPE_UINT16 ||
+                    argt == DBUS_TYPE_INT32 || argt == DBUS_TYPE_UINT32 || argt == DBUS_TYPE_INT64 || argt == DBUS_TYPE_UINT64 || argt == DBUS_TYPE_DOUBLE) {
+                    out = dbus_basic_to_string(argt, &iter);
+                    if (argt == DBUS_TYPE_STRING || argt == DBUS_TYPE_OBJECT_PATH || argt == DBUS_TYPE_SIGNATURE) {
+                        const char* s = nullptr; dbus_message_iter_get_basic(&iter, &s); out = s ? s : "";
                     }
-                } else if (argt == DBUS_TYPE_ARRAY) {
-                    // Try to parse a{sv} into a JSON string
-                    int elem_type = dbus_message_iter_get_element_type(&iter);
-                    if (elem_type == DBUS_TYPE_DICT_ENTRY) {
-                        DBusMessageIter arr;
-                        dbus_message_iter_recurse(&iter, &arr);
-                        std::string json = "{";
-                        bool first = true;
-                        while (dbus_message_iter_get_arg_type(&arr) == DBUS_TYPE_DICT_ENTRY) {
-                            DBusMessageIter dict;
-                            dbus_message_iter_recurse(&arr, &dict);
-                            // key
-                            const char* key = "";
-                            if (dbus_message_iter_get_arg_type(&dict) == DBUS_TYPE_STRING) {
-                                dbus_message_iter_get_basic(&dict, &key);
-                                dbus_message_iter_next(&dict);
-                            }
-                            // value (variant)
-                            std::string valueStr = "null";
-                            if (dbus_message_iter_get_arg_type(&dict) == DBUS_TYPE_VARIANT) {
-                                DBusMessageIter var;
-                                dbus_message_iter_recurse(&dict, &var);
-                                int vt = dbus_message_iter_get_arg_type(&var);
-                                if (vt == DBUS_TYPE_STRING) {
-                                    const char* s; dbus_message_iter_get_basic(&var, &s);
-                                    valueStr = std::string("\"") + (s ? s : "") + "\"";
-                                } else if (vt == DBUS_TYPE_BOOLEAN) {
-                                    dbus_bool_t b; dbus_message_iter_get_basic(&var, &b);
-                                    valueStr = b ? "true" : "false";
-                                } else if (vt == DBUS_TYPE_UINT32) {
-                                    uint32_t u; dbus_message_iter_get_basic(&var, &u);
-                                    valueStr = std::to_string(u);
-                                } else if (vt == DBUS_TYPE_INT32) {
-                                    int32_t i; dbus_message_iter_get_basic(&var, &i);
-                                    valueStr = std::to_string(i);
                                 } else {
-                                    valueStr = "null";
-                                }
-                            }
-                            if (!first) json += ","; first = false;
-                            json += "\""; json += (key ? key : ""); json += "\":"; json += valueStr;
-                            dbus_message_iter_next(&arr);
-                        }
-                        json += "}";
-                        out = std::move(json);
-                    }
+                    std::string json; dbus_value_to_json(json, &iter); out = std::move(json);
                 }
             }
             // Deliver to the matching promise if mapping exists
@@ -206,6 +311,10 @@ static void pump_loop() {
             if (id != 0) {
                 std::lock_guard<std::mutex> lk(g_replyMutex);
                 g_replies.push(ReplyItem{id, errname == nullptr, std::move(out)});
+            }
+            if (g_debug) {
+                fprintf(stderr, "dbus recv: reply_serial=%u -> id=%u ok=%d payload_len=%zu err=%s\n",
+                        reply_serial, id, errname == nullptr, out.size(), errname ? errname : "");
             }
         } else if (type == DBUS_MESSAGE_TYPE_SIGNAL) {
             SignalItem si;
@@ -228,9 +337,23 @@ static void pump_loop() {
     }
 }
 
-// JS: connect("session"|"system") — initializes libdbus (once), connects, and
-// starts the pump thread. No I/O happens on the JS thread.
+// JS: connect("session"|"system") — asynchronously connects to dbus on a worker
+// thread and starts the pump thread. Returns a Promise<void> that resolves when
+// connected. Avoids blocking the JS/engine thread.
 static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    // If already connected, return immediately
+    if (g_conn != nullptr) {
+        // Return an already-resolved Promise for API consistency
+        JSValue funcs[2];
+        JSValue promise = JS_NewPromiseCapability(ctx, funcs);
+        JSValue resolve = funcs[0];
+        JSValue dummy = JS_NewString(ctx, "");
+        JS_Call(ctx, resolve, JS_UNDEFINED, 1, &dummy);
+        JS_FreeValue(ctx, dummy);
+        JS_FreeValue(ctx, resolve);
+        JS_FreeValue(ctx, funcs[1]);
+        return promise;
+    }
     // Initialize libdbus threading once if using threads
     bool expected = false;
     if (g_threadsInited.compare_exchange_strong(expected, true)) {
@@ -241,36 +364,107 @@ static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSVal
         std::string t = js_to_string(ctx, argv[0]);
         if (t == "system") type = BusType::System;
     }
+    // Enable debug logging if requested
+    if (const char* dbg = getenv("KOYA_DBUS_DEBUG")) {
+        g_debug = (dbg[0] != '\0' && dbg[0] != '0');
+    }
+
+    // Create a Promise and resolve/reject it from the update hook once the
+    // background thread finishes connecting.
+    JSValue funcs[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, funcs);
+    JSValue resolve = funcs[0];
+    JSValue reject  = funcs[1];
+    uint32_t id = g_nextId++;
+    {
+        std::lock_guard<std::mutex> lk(g_promMutex);
+        g_promises.emplace(id, PendingPromise{ctx, resolve, reject, now_ms(), 3000});
+    }
+
+    // Queue as a waiter and start a single background connect if not already in-flight
+    {
+        std::lock_guard<std::mutex> lk(g_connectWaitersMutex);
+        g_connectWaiterIds.push_back(id);
+    }
+    bool expectedConnecting = false;
+    if (!g_connecting.compare_exchange_strong(expectedConnecting, true)) {
+        return promise; // another connect is in flight; we'll resolve when it finishes
+    }
+
+    std::thread([type]() {
     DBusError err; dbus_error_init(&err);
     DBusConnection* conn = dbus_bus_get(type == BusType::System ? DBUS_BUS_SYSTEM : DBUS_BUS_SESSION, &err);
     if (!conn) {
         std::string e = err.message ? err.message : "failed to connect to bus";
         dbus_error_free(&err);
-        return JS_ThrowInternalError(ctx, "%s", e.c_str());
-    }
+            // Notify all waiters of failure
+            std::vector<uint32_t> waiters;
+            {
+                std::lock_guard<std::mutex> lk(g_connectWaitersMutex);
+                waiters.swap(g_connectWaiterIds);
+            }
+            if (!waiters.empty()) {
+                std::lock_guard<std::mutex> lk(g_replyMutex);
+                for (uint32_t wid : waiters) {
+                    g_replies.push(ReplyItem{wid, false, e});
+                }
+            }
+            g_connecting.store(false);
+            return;
+        }
+        // Do not exit process on disconnect
+        dbus_connection_set_exit_on_disconnect(conn, false);
     g_conn = conn; g_busType = type;
+        // Start pump thread if not running
     if (!g_running.exchange(true)) {
         if (g_pumpThread.joinable()) {
-            // Shouldn't happen, but ensure no stray joinable thread
             g_pumpThread.join();
         }
         g_pumpThread = std::thread(pump_loop);
     }
-    return JS_UNDEFINED;
+        if (g_debug) fprintf(stderr, "dbus: connected to %s bus\n", type == BusType::System ? "system" : "session");
+        // Notify all waiters of success
+        std::vector<uint32_t> waiters;
+        {
+            std::lock_guard<std::mutex> lk(g_connectWaitersMutex);
+            waiters.swap(g_connectWaiterIds);
+        }
+        if (!waiters.empty()) {
+            std::lock_guard<std::mutex> lk(g_replyMutex);
+            for (uint32_t wid : waiters) {
+                g_replies.push(ReplyItem{wid, true, std::string()});
+            }
+        }
+        g_connecting.store(false);
+    }).detach();
+
+    return promise;
 }
 
 // JS: addMatch(rule) — convenience wrapper for dbus_bus_add_match.
 static JSValue js_addMatch(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     if (argc < 1) return JS_ThrowTypeError(ctx, "addMatch expects (string)");
     std::string rule = js_to_string(ctx, argv[0]);
-    DBusError err; dbus_error_init(&err);
-    dbus_bus_add_match(g_conn, rule.c_str(), &err);
-    dbus_connection_flush(g_conn);
-    if (dbus_error_is_set(&err)) {
-        std::string e = err.message ? err.message : "add_match failed";
-        dbus_error_free(&err);
-        return JS_ThrowInternalError(ctx, "%s", e.c_str());
+    // Non-blocking AddMatch: send method call without waiting for a reply
+    DBusMessage* msg = dbus_message_new_method_call(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "AddMatch");
+    if (!msg) return JS_ThrowInternalError(ctx, "failed to allocate message");
+    DBusMessageIter iter; dbus_message_iter_init_append(msg, &iter);
+    const char* s = rule.c_str();
+    if (!dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING, &s)) {
+        dbus_message_unref(msg);
+        return JS_ThrowInternalError(ctx, "failed to append arg");
     }
+    {
+        std::lock_guard<std::mutex> iolk(g_busIoMutex);
+        dbus_connection_send(g_conn, msg, nullptr);
+    dbus_connection_flush(g_conn);
+    }
+    dbus_message_unref(msg);
+    if (g_debug) fprintf(stderr, "dbus addMatch: %s\n", rule.c_str());
     return JS_UNDEFINED;
 }
 
@@ -291,12 +485,80 @@ static JSValue js_call(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
     if (!msg) return JS_ThrowInternalError(ctx, "failed to allocate message");
     DBusMessageIter iter; dbus_message_iter_init_append(msg, &iter);
     // Minimal support: single string arg if provided
-    if (!sig.empty() && sig == "s" && argc > argi) {
-        std::string val = js_to_string(ctx, argv[argi]);
+    if (!sig.empty()) {
+        for (size_t si = 0; si < sig.size(); ++si) {
+            if (argi + (int)si >= argc) break;
+            char t = sig[si];
+            JSValueConst av = argv[argi + si];
+            bool ok = true;
+            switch (t) {
+                case 's': {
+                    std::string val = js_to_string(ctx, av);
+                    const char* s = val.c_str();
+                    ok = dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING, &s);
+                    break;
+                }
+                case 'o': { // object path as string
+                    std::string val = js_to_string(ctx, av);
         const char* s = val.c_str();
-        if (!dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING, &s)) {
+                    ok = dbus_message_iter_append_basic(&iter, DBUS_TYPE_OBJECT_PATH, &s);
+                    break;
+                }
+                case 'b': {
+                    int b = JS_ToBool(ctx, av);
+                    dbus_bool_t bv = b ? 1 : 0;
+                    ok = dbus_message_iter_append_basic(&iter, DBUS_TYPE_BOOLEAN, &bv);
+                    break;
+                }
+                case 'i': {
+                    int32_t v = 0; JS_ToInt32(ctx, &v, av);
+                    ok = dbus_message_iter_append_basic(&iter, DBUS_TYPE_INT32, &v);
+                    break;
+                }
+                case 'u': {
+                    int64_t tmp = 0; JS_ToInt64(ctx, &tmp, av); uint32_t v = (uint32_t)tmp;
+                    ok = dbus_message_iter_append_basic(&iter, DBUS_TYPE_UINT32, &v);
+                    break;
+                }
+                case 'x': { // int64
+                    int64_t v = 0; JS_ToInt64(ctx, &v, av);
+                    ok = dbus_message_iter_append_basic(&iter, DBUS_TYPE_INT64, &v);
+                    break;
+                }
+                case 't': { // uint64
+                    int64_t tmp = 0; JS_ToInt64(ctx, &tmp, av); uint64_t v = (uint64_t)tmp;
+                    ok = dbus_message_iter_append_basic(&iter, DBUS_TYPE_UINT64, &v);
+                    break;
+                }
+                case 'd': { // double
+                    double v = 0; JS_ToFloat64(ctx, &v, av);
+                    ok = dbus_message_iter_append_basic(&iter, DBUS_TYPE_DOUBLE, &v);
+                    break;
+                }
+                case 'y': { // byte
+                    int64_t tmp = 0; JS_ToInt64(ctx, &tmp, av); uint8_t v = (uint8_t)tmp;
+                    ok = dbus_message_iter_append_basic(&iter, DBUS_TYPE_BYTE, &v);
+                    break;
+                }
+                case 'n': { // int16
+                    int64_t tmp = 0; JS_ToInt64(ctx, &tmp, av); int16_t v = (int16_t)tmp;
+                    ok = dbus_message_iter_append_basic(&iter, DBUS_TYPE_INT16, &v);
+                    break;
+                }
+                case 'q': { // uint16
+                    int64_t tmp = 0; JS_ToInt64(ctx, &tmp, av); uint16_t v = (uint16_t)tmp;
+                    ok = dbus_message_iter_append_basic(&iter, DBUS_TYPE_UINT16, &v);
+                    break;
+                }
+                default: {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) {
             dbus_message_unref(msg);
             return JS_ThrowInternalError(ctx, "failed to append arg");
+            }
         }
     }
 
@@ -308,17 +570,28 @@ static JSValue js_call(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
     uint32_t id = g_nextId++;
     {
         std::lock_guard<std::mutex> lk(g_promMutex);
-        g_promises.emplace(id, PendingPromise{ctx, resolve, reject});
+        g_promises.emplace(id, PendingPromise{ctx, resolve, reject, now_ms(), 5000});
     }
     // Send message and capture serial so we can correlate the reply
     uint32_t serial = 0;
+    {
+        std::lock_guard<std::mutex> iolk(g_busIoMutex);
     dbus_connection_send(g_conn, msg, &serial);
-    dbus_connection_flush(g_conn);
-    dbus_message_unref(msg);
     if (serial != 0) {
         std::lock_guard<std::mutex> lk(g_serialMapMutex);
         g_serialToPromiseId.emplace(serial, id);
     }
+        dbus_connection_flush(g_conn);
+    }
+    if (g_debug) {
+        const char* c_dest = dest.c_str();
+        const char* c_path = path.c_str();
+        const char* c_iface = iface.c_str();
+        const char* c_method = method.c_str();
+        fprintf(stderr, "dbus send: id=%u serial=%u dest=%s iface=%s member=%s path=%s sig=%s\n",
+                id, serial, c_dest, c_iface, c_method, c_path, sig.empty() ? "" : sig.c_str());
+    }
+    dbus_message_unref(msg);
     return promise;
 }
 
@@ -354,11 +627,36 @@ static JSValue js_offSignal(JSContext* ctx, JSValueConst this_val, int argc, JSV
 // signals to JS by resolving Promises and calling registered handlers.
 static void dbus_update(void*) {
     if (!g_ctx) return;
+    // 0) timeouts: synthesize replies for expired promises
+    std::vector<ReplyItem> timedOut;
+    {
+        uint64_t now = now_ms();
+        std::lock_guard<std::mutex> lk(g_promMutex);
+        for (auto it = g_promises.begin(); it != g_promises.end(); ) {
+            const PendingPromise& p = it->second;
+            if (p.timeoutMs > 0 && now - p.createdMs > p.timeoutMs) {
+                timedOut.push_back(ReplyItem{it->first, false, std::string("ERROR:timeout")});
+                // Remove any serial mapping to this id
+                {
+                    std::lock_guard<std::mutex> lk2(g_serialMapMutex);
+                    for (auto it2 = g_serialToPromiseId.begin(); it2 != g_serialToPromiseId.end(); ) {
+                        if (it2->second == it->first) it2 = g_serialToPromiseId.erase(it2); else ++it2;
+                    }
+                }
+                it = g_promises.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     // 1) replies
     std::vector<ReplyItem> replies;
     {
         std::lock_guard<std::mutex> lk(g_replyMutex);
         while (!g_replies.empty()) { replies.push_back(std::move(g_replies.front())); g_replies.pop(); }
+    }
+    if (!timedOut.empty()) {
+        replies.insert(replies.end(), timedOut.begin(), timedOut.end());
     }
     if (!replies.empty()) {
         std::lock_guard<std::mutex> lk(g_promMutex);
@@ -439,9 +737,24 @@ JSModuleDef* integrate(JSContext* ctx, const char* module_name, RegisterHookFunc
     registerHook("cleanup", [](void*){
         // Stop pump loop
         g_running.store(false);
+        g_connecting.store(false);
         // Join pump thread to avoid races with connection teardown
         if (g_pumpThread.joinable()) {
             g_pumpThread.join();
+        }
+        // Clear any queued connect waiters to avoid leaking promises on shutdown
+        {
+            std::vector<uint32_t> waiters;
+            {
+                std::lock_guard<std::mutex> lk(g_connectWaitersMutex);
+                waiters.swap(g_connectWaiterIds);
+            }
+            if (!waiters.empty()) {
+                std::lock_guard<std::mutex> lk(g_replyMutex);
+                for (uint32_t wid : waiters) {
+                    g_replies.push(ReplyItem{wid, false, std::string("canceled")});
+                }
+            }
         }
         // Free signal callbacks
         {
