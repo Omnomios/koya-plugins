@@ -495,6 +495,44 @@ extern "C" {
 JSModuleDef* integrate(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook) {
     g_ctx = ctx;
     registerHook("update", hypr_update_callback);
+    // Ensure we release all JS references and stop background work on engine shutdown
+    registerHook("cleanup", [](void* /*data*/){
+        // Signal background thread to stop
+        g_running.store(false);
+        // Best-effort: drop any queued events
+        {
+            std::lock_guard<std::mutex> lk(g_queueMutex);
+            while (!g_eventQueue.empty()) g_eventQueue.pop();
+        }
+        // Free all subscriber callbacks
+        {
+            std::lock_guard<std::mutex> lk(g_subMutex);
+            for (auto &kv : g_subscribers) {
+                for (auto &cb : kv.second) {
+                    if (JS_IsFunction(g_ctx, cb.func)) {
+                        JS_FreeValue(g_ctx, cb.func);
+                    }
+                }
+            }
+            g_subscribers.clear();
+        }
+        // Free any pending promise resolve/reject functions
+        {
+            std::lock_guard<std::mutex> lk(g_promisesMutex);
+            for (auto &kv : g_promises) {
+                JS_FreeValue(g_ctx, kv.second.resolve);
+                JS_FreeValue(g_ctx, kv.second.reject);
+            }
+            g_promises.clear();
+        }
+        // Drop completed results queue
+        {
+            std::lock_guard<std::mutex> lk(g_resultsMutex);
+            while (!g_results.empty()) g_results.pop();
+        }
+        // Clear context pointer last
+        g_ctx = nullptr;
+    });
     JSModuleDef* m = JS_NewCModule(ctx, module_name, hypr_module_init);
     if (!m) return nullptr;
     JS_AddModuleExport(ctx, m, "connect");
