@@ -17,7 +17,7 @@ Typical shape of a plugin: export `integrate(JSContext*, const char*, RegisterHo
 
 DBus (minimal):
 ```js
-import * as dbus from 'dbus';
+import * as dbus from 'Module/dbus';
 await dbus.connect('session');
 dbus.addMatch("type='signal',interface='org.freedesktop.DBus'");
 dbus.onSignal(s => console.log('signal', s));
@@ -26,14 +26,14 @@ const reply = await dbus.call('org.freedesktop.DBus', '/org/freedesktop/DBus', '
 
 HTTP:
 ```js
-import * as http from 'http';
+import * as http from 'Module/http';
 const res = await http.request({ url: 'https://example.com', method: 'get' });
 console.log(res.status, res.body);
 ```
 
 Hyprland IPC:
 ```js
-import * as hypr from 'hypr';
+import * as hypr from 'Module/hypr';
 await hypr.connect({});
 hypr.on('workspace', e => console.log('workspace event', e));
 const ws = await hypr.workspaces();
@@ -41,7 +41,7 @@ const ws = await hypr.workspaces();
 
 Process:
 ```js
-import * as proc from 'process';
+import * as proc from 'Module/process';
 const p = proc.spawn({ cmd: 'bash', args: ['-lc', 'echo hi && sleep 1 && echo bye'] });
 p.stdout.on('data', chunk => print('out', chunk));
 p.on('exit', code => print('exit', code));
@@ -49,7 +49,7 @@ p.on('exit', code => print('exit', code));
 
 SQLite:
 ```js
-import * as sql from 'sqlite';
+import * as sql from 'Module/sqlite';
 const db = await sql.openInMemory();
 await sql.exec(db, 'create table t(x)');
 await sql.exec(db, "insert into t values('hello')");
@@ -58,7 +58,7 @@ const rows = await sql.query(db, 'select * from t');
 
 WebSocket:
 ```js
-import * as ws from 'ws';
+import * as ws from 'Module/ws';
 const sock = ws.create({ url: 'wss://echo.websocket.org', onMessage: m => print('msg', m) });
 sock.start();
 sock.send('hello');
