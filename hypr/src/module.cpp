@@ -260,7 +260,7 @@ static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSVal
         JS_FreeValue(ctx, v);
     }
     if (runtimeDir.empty() || instanceSig.empty()) {
-        return JS_ThrowReferenceError(ctx, "Missing XDG_RUNTIME_DIR or HYPRLAND_INSTANCE_SIGNATURE");
+        return JS_ThrowReferenceError(ctx, "Module/hypr: Hyprland not detected (missing HYPRLAND_INSTANCE_SIGNATURE or XDG_RUNTIME_DIR). This plugin requires the Hyprland compositor; if you are running another compositor (e.g. Weston), do not load Module/hypr.");
     }
 
     g_runtimeDir = runtimeDir;
