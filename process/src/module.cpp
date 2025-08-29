@@ -603,11 +603,11 @@ static void process_update_callback(void* /*data*/)
 
 extern "C" {
 // How to extend:
-// - Export `integrate` from your shared library.
+// - Export `integrateV1` from your shared library.
 // - Wire an `update` hook to deliver cross-thread events back to JS.
 // - Wire a `cleanup` hook to release OS handles and JS references.
 // - Create your JS module and list named exports with JS_AddModuleExport.
-JSModuleDef* integrate(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook)
+JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*)
 {
     g_ctx = ctx;
     registerHook("update", process_update_callback);
@@ -642,40 +642,27 @@ JSModuleDef* integrate(JSContext* ctx, const char* module_name, RegisterHookFunc
                     ids_and_pids.emplace_back(kv.first, p.pid);
                     ::kill(p.pid, SIGTERM);
                 }
+            }
+            // close fds for all tracked processes
+            for (auto &kv : g_processes) {
+                auto &p = *kv.second;
                 if (p.stdin_fd  >= 0) { ::close(p.stdin_fd);  p.stdin_fd  = -1; }
                 if (p.stdout_fd >= 0) { ::close(p.stdout_fd); p.stdout_fd = -1; }
                 if (p.stderr_fd >= 0) { ::close(p.stderr_fd); p.stderr_fd = -1; }
             }
         }
-        // Give processes a brief grace period to exit, then SIGKILL if needed
-        for (int tries = 0; tries < 10; ++tries) {
-            bool any_alive = false;
-            for (auto &ip : ids_and_pids) {
-                int status = 0;
-                pid_t r = waitpid(ip.second, &status, WNOHANG);
-                if (r == 0) any_alive = true; // still alive
-            }
-            if (!any_alive) break;
-            usleep(50000); // 50ms
-        }
+        // Reap children
         for (auto &ip : ids_and_pids) {
-            int status = 0;
-            if (waitpid(ip.second, &status, WNOHANG) == 0) {
-                ::kill(ip.second, SIGKILL);
-                (void)waitpid(ip.second, &status, 0);
-            }
+            int status = 0; (void)status; waitpid(ip.second, &status, 0);
         }
-        // Finally clear process/listener maps under lock
-        {
-            std::lock_guard<std::mutex> lk(g_proc_mutex);
-            g_processes.clear();
-            g_listeners.clear();
-        }
+        // Clear maps
+        g_processes.clear();
     });
     JSModuleDef* m = JS_NewCModule(ctx, module_name, process_module_init);
-    if (!m) return nullptr;
+    if(!m) return nullptr;
     JS_AddModuleExport(ctx, m, "spawn");
     JS_AddModuleExport(ctx, m, "exec");
+    JS_AddModuleExport(ctx, m, "drain");
     return m;
 }
 }

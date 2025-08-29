@@ -47,7 +47,7 @@
 #include <dbus/dbus.h>
 
 #include "../../sdk/quickjs/quickjs.h"
-#include "../../module_hooks.h"
+#include "../../sdk/module_hooks.h"
 
 namespace {
 
@@ -1113,12 +1113,8 @@ static int dbus_module_init(JSContext* ctx, JSModuleDef* m) {
 }
 
 extern "C" {
-// How to extend:
-// - Export an `integrate` symbol from your shared library.
-// - Register any hooks you need using the provided RegisterHookFunc.
-// - Construct a QuickJS module with your exported functions.
-// Koya will call this when it loads the module from disk.
-JSModuleDef* integrate(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook) {
+// Required entry point
+JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*) {
     g_ctx = ctx;
     registerHook("update", dbus_update);
     registerHook("cleanup", [](void*){

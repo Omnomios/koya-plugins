@@ -25,7 +25,7 @@
 #include <security/pam_appl.h>
 
 #include "../../sdk/quickjs/quickjs.h"
-#include "../../module_hooks.h"
+#include "../../sdk/module_hooks.h"
 
 namespace {
 
@@ -225,7 +225,7 @@ static void pam_update(void*)
 } // namespace
 
 extern "C" {
-JSModuleDef* integrate(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook)
+JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*)
 {
     g_ctx = ctx;
     if (!g_running.exchange(true)) {

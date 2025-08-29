@@ -31,7 +31,7 @@
 #include <cstdio>
 
 // Include the hook system interface
-#include "../../module_hooks.h"
+#include "../../sdk/module_hooks.h"
 
 // Static Http instance for the module
 static Http http_instance;
@@ -156,11 +156,8 @@ void http_update_callback(void* data)
 }
 
 extern "C" {
-// How to extend:
-// - Export `integrate` from your shared library.
-// - Register hooks you need (at least `update` if you queue work).
-// - Build your JS module and add exports.
-JSModuleDef* integrate (JSContext* ctx, const char* module_name, RegisterHookFunc registerHook)
+// Required entry point
+JSModuleDef* integrateV1 (JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*)
 {
     // Register our update hook callback with the engine
     registerHook("update", http_update_callback);

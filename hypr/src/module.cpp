@@ -46,7 +46,7 @@
 #include <unistd.h>
 
 #include "../../sdk/quickjs/quickjs.h"
-#include "../../module_hooks.h"
+#include "../../sdk/module_hooks.h"
 
 namespace {
 
@@ -488,11 +488,8 @@ static int hypr_module_init(JSContext* ctx, JSModuleDef* m) {
 }
 
 extern "C" {
-// How to extend:
-// - Provide `integrate` and register an `update` hook if you do background work.
-// - Create a module and export functions with `JS_SetModuleExport`.
-// - Use `JS_AddModuleExport` to finalize named exports.
-JSModuleDef* integrate(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook) {
+// Required entry point
+JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*) {
     g_ctx = ctx;
     registerHook("update", hypr_update_callback);
     // Ensure we release all JS references and stop background work on engine shutdown

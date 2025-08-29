@@ -30,7 +30,7 @@
 #include <condition_variable>
 
 #include "../../sdk/quickjs/quickjs.h"
-#include "../../module_hooks.h"
+#include "../../sdk/module_hooks.h"
 #include <functional>
 
 // RAII wrapper for sqlite3* handle tracked by id.
@@ -221,10 +221,8 @@ static int sqlite_module_init(JSContext* ctx, JSModuleDef* m) {
 }
 
 extern "C" {
-// How to extend:
-// - Export `integrate` from your .so. Register `update` to run completions on the engine thread.
-// - Build a module with your exports and finalize names with `JS_AddModuleExport`.
-JSModuleDef* integrate(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook) {
+// Required entry point
+JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*) {
     g_ctx = ctx;
         // Hook: update — runs completions (Promise resolve/reject) on engine thread.
         registerHook("update", [](void*){

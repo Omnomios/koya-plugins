@@ -7,7 +7,7 @@ This repository showcases native plugins that extend the Koya runtime with syste
 - Engine (Koya): JavaScript runtime (QuickJS), module system, and lifecycle hooks so work can be executed on the engine thread.
 - Plugin (your code): Performs OS/network I/O and threading, then delivers results back to JS during engine hooks.
 
-Typical shape of a plugin: export `integrate(JSContext*, const char*, RegisterHookFunc)` which:
+Typical shape of a plugin: export `integrateV1(JSContext*, const char*, RegisterHookFunc, const KoyaRendererV1*)` which:
 
 - Registers `update` (and optionally `cleanup`) using the provided `RegisterHookFunc`.
 - Creates a JS module via `JS_NewCModule` and exports your API functions.
@@ -81,15 +81,15 @@ These are native modules intended to extend a binary distribution of Koya. You d
 
 - Ensure you have the Koya SDK bits available at build time: QuickJS headers and the `module_hooks.h` interface (see `sdk/quickjs/` and `module_hooks.h` in this repo).
 - Use the provided `CMakeLists.txt` in each plugin to build a shared library.
-- The output is a shared object exposing `integrate(JSContext*, const char*, RegisterHookFunc)` that Koya can discover and load.
+- The output is a shared object exposing `integrateV1(JSContext*, const char*, RegisterHookFunc, const KoyaRendererV1*)` that Koya can discover and load.
 - Consult Koya's distribution docs for where to place the built module and how it is discovered at runtime.
 
 ### Create your own plugin
 
 1. Copy a minimal module (e.g., `sqlite/src/module.cpp`).
-2. Implement `integrate(...)`, create a JS module with `JS_NewCModule`, and export your API with `JS_SetModuleExport` + `JS_AddModuleExport`.
+2. Implement `integrateV1(...)`, create a JS module with `JS_NewCModule`, and export your API with `JS_SetModuleExport` + `JS_AddModuleExport`.
 3. Keep blocking/async work off-thread; queue results from workers.
-4. Drain queues and settle Promises in the `update` hook. Release all JS values and OS resources in `cleanup`.
+4. Drain queues and settle Promises in the `update` or `render_begin` hook. Release all JS values and OS resources in `cleanup`.
 5. Build as a shared library; place it where the Koya binary expects modules.
 
 Koya website: [koya-ui.com](https://www.koya-ui.com)

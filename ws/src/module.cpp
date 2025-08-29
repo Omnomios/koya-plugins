@@ -39,7 +39,7 @@
 #include "../../sdk/quickjs/quickjs.h"
 
 // Include the hook system interface
-#include "../../module_hooks.h"
+#include "../../sdk/module_hooks.h"
 
 // WebSocket state
 // JS callbacks tied to a WebSocket instance.
@@ -385,12 +385,9 @@ void ws_update_callback(void* data)
     }
 }
 
-extern "C"
-{
-// How to extend:
-// - Export `integrate` and register `update` if you queue network messages.
-// - Build a JS module and expose your functions; avoid calling JS off-thread.
-JSModuleDef* integrate ( JSContext* ctx, const char* module_name, RegisterHookFunc registerHook )
+extern "C" {
+// Required entry point with renderer services (unused by this plugin but part of ABI)
+JSModuleDef* integrateV1 ( JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1* )
 {
     // Store the context for use in update callback
     g_ws_ctx = ctx;
