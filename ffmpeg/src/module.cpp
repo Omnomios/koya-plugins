@@ -79,6 +79,12 @@ static const KoyaRendererV1* g_renderer = nullptr;
 static std::mutex g_mutex;
 static std::map<std::string, std::unique_ptr<VideoStream>> g_streams; // key -> stream
 
+// Build a unique id per window+key to avoid collisions across windows
+static inline std::string make_stream_id(uint32_t windowId, const std::string& key)
+{
+    return std::to_string(windowId) + "|" + key;
+}
+
 // JS: load(windowId, key, path)
 static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv)
 {
@@ -86,6 +92,17 @@ static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
     uint32_t windowId = 0; JS_ToUint32(ctx, &windowId, argv[0]);
     const char* k = JS_ToCString(ctx, argv[1]); if(!k) return JS_EXCEPTION;
     const char* vpath = JS_ToCString(ctx, argv[2]); if(!vpath) { JS_FreeCString(ctx, k); return JS_EXCEPTION; }
+
+    // Prevent duplicate loads for the same windowId|key
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        if(g_streams.find(make_stream_id(windowId, k)) != g_streams.end())
+        {
+            JS_FreeCString(ctx, vpath);
+            JS_FreeCString(ctx, k);
+            return JS_ThrowInternalError(ctx, "stream already loaded");
+        }
+    }
 
     // Allocate and open
     auto vs = std::make_unique<VideoStream>();
@@ -294,8 +311,11 @@ static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
         av_packet_free(&pkt);
     });
 
-    std::lock_guard<std::mutex> lk(g_mutex);
-    g_streams[vs->key] = std::move(vs);
+    // Store under composite key (windowId|key) to prevent cross-window collisions
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        g_streams[make_stream_id(windowId, vs->key)] = std::move(vs);
+    }
     return JS_UNDEFINED;
 }
 
@@ -308,8 +328,8 @@ static JSValue js_stop(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
     std::unique_ptr<VideoStream> victim;
     {
         std::lock_guard<std::mutex> lk(g_mutex);
-        auto it = g_streams.find(k);
-        if(it != g_streams.end() && it->second->windowId == windowId) {
+        auto it = g_streams.find(make_stream_id(windowId, k));
+        if(it != g_streams.end()) {
             it->second->running.store(false);
             if(it->second->worker.joinable()) it->second->worker.join();
             if(it->second->sws) { sws_freeContext(it->second->sws); it->second->sws = nullptr; }
@@ -343,8 +363,8 @@ static JSValue js_play(JSContext* ctx, JSValueConst, int argc, JSValueConst* arg
     uint32_t windowId = 0; JS_ToUint32(ctx, &windowId, argv[0]);
     const char* k = JS_ToCString(ctx, argv[1]); if(!k) return JS_EXCEPTION;
     std::lock_guard<std::mutex> lk(g_mutex);
-    auto it = g_streams.find(k);
-    if(it != g_streams.end() && it->second->windowId == windowId) {
+    auto it = g_streams.find(make_stream_id(windowId, k));
+    if(it != g_streams.end()) {
         if(!it->second->playing.load()) {
             auto now = std::chrono::steady_clock::now();
             if(it->second->pauseTp.time_since_epoch().count() != 0) {
@@ -362,8 +382,8 @@ static JSValue js_pause(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
     uint32_t windowId = 0; JS_ToUint32(ctx, &windowId, argv[0]);
     const char* k = JS_ToCString(ctx, argv[1]); if(!k) return JS_EXCEPTION;
     std::lock_guard<std::mutex> lk(g_mutex);
-    auto it = g_streams.find(k);
-    if(it != g_streams.end() && it->second->windowId == windowId) {
+    auto it = g_streams.find(make_stream_id(windowId, k));
+    if(it != g_streams.end()) {
         it->second->playing.store(false);
         it->second->pauseTp = std::chrono::steady_clock::now();
     }
@@ -379,8 +399,8 @@ static JSValue js_details(JSContext* ctx, JSValueConst, int argc, JSValueConst* 
     const char* k = JS_ToCString(ctx, argv[1]); if(!k) return JS_EXCEPTION;
     JSValue obj = JS_NewObject(ctx);
     std::lock_guard<std::mutex> lk(g_mutex);
-    auto it = g_streams.find(k);
-    if(it != g_streams.end() && it->second->windowId == windowId)
+    auto it = g_streams.find(make_stream_id(windowId, k));
+    if(it != g_streams.end())
     {
         auto* s = it->second.get();
         JS_SetPropertyStr(ctx, obj, "width", JS_NewInt32(ctx, s->width));
