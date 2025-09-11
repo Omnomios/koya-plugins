@@ -229,6 +229,9 @@ static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
                 s->firstPtsSec = std::numeric_limits<double>::quiet_NaN();
                 s->nextDueSec = 0.0;
                 s->startTp = std::chrono::steady_clock::now();
+                // Clear accumulated pause so new loop doesn't inherit previous pause time
+                s->pausedAccumSec = 0.0;
+                s->pauseTp = std::chrono::steady_clock::time_point{};
                 // Seek to start and continue
                 av_seek_frame(s->fmt, s->videoStreamIndex, 0, AVSEEK_FLAG_BACKWARD);
                 continue;
