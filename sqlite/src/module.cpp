@@ -52,9 +52,15 @@ struct Job { JobType type; JobExec e; JobQuery q; };
 static std::mutex g_job_mutex;
 static std::condition_variable g_job_cv;
 static std::queue<Job> g_jobs;
-// Row with (name,value) pairs as strings for simplicity; NULL yields empty.
+// Row with (name,value,type) pairs preserving SQLite types
+enum class SqliteValueType { Null, Integer, Float, Text, Blob };
+struct QueryResultColumn {
+    std::string name;
+    std::string value;
+    SqliteValueType type;
+};
 struct QueryResultRow {
-    std::vector<std::pair<std::string, std::string>> cols;
+    std::vector<QueryResultColumn> cols;
 };
 // Completed query result; delivered as JS array of row objects.
 struct QueryResult {
@@ -330,29 +336,38 @@ static void worker_thread_body() {
                         for (int c = 0; c < col_count; ++c) {
                             const char* name = sqlite3_column_name(stmt, c);
                             int type = sqlite3_column_type(stmt, c);
+                            QueryResultColumn col;
+                            col.name = name ? name : "";
+                            
                             switch (type) {
                                 case SQLITE_INTEGER: {
                                     long long v = sqlite3_column_int64(stmt, c);
-                                    row.cols.emplace_back(name ? name : "", std::to_string(v));
+                                    col.value = std::to_string(v);
+                                    col.type = SqliteValueType::Integer;
                                     break; }
                                 case SQLITE_FLOAT: {
                                     double v = sqlite3_column_double(stmt, c);
-                                    row.cols.emplace_back(name ? name : "", std::to_string(v));
+                                    col.value = std::to_string(v);
+                                    col.type = SqliteValueType::Float;
                                     break; }
                                 case SQLITE_TEXT: {
                                     const unsigned char* txt = sqlite3_column_text(stmt, c);
-                                    row.cols.emplace_back(name ? name : "", std::string((const char*)txt));
+                                    col.value = std::string((const char*)txt);
+                                    col.type = SqliteValueType::Text;
                                     break; }
                                 case SQLITE_NULL: {
-                                    row.cols.emplace_back(name ? name : "", std::string());
+                                    col.value = "";
+                                    col.type = SqliteValueType::Null;
                                     break; }
                                 case SQLITE_BLOB:
                                 default: {
                                     const void* blob = sqlite3_column_blob(stmt, c);
                                     int bytes = sqlite3_column_bytes(stmt, c);
-                                    row.cols.emplace_back(name ? name : "", std::string((const char*)blob, (size_t)bytes));
+                                    col.value = std::string((const char*)blob, (size_t)bytes);
+                                    col.type = SqliteValueType::Blob;
                                     break; }
                             }
+                            row.cols.push_back(std::move(col));
                         }
                         res.rows.push_back(std::move(row));
                     }
@@ -371,12 +386,30 @@ static void worker_thread_body() {
                         uint32_t idx = 0;
                         for (const auto& r : res.rows) {
                             JSValue obj = JS_NewObject(g_ctx);
-                            for (const auto& kv : r.cols) {
-                                if (kv.second.empty()) {
-                                    JS_SetPropertyStr(g_ctx, obj, kv.first.c_str(), JS_NULL);
-                                } else {
-                                    JS_SetPropertyStr(g_ctx, obj, kv.first.c_str(), JS_NewStringLen(g_ctx, kv.second.data(), kv.second.size()));
+                            for (const auto& col : r.cols) {
+                                JSValue jsValue;
+                                switch (col.type) {
+                                    case SqliteValueType::Null:
+                                        jsValue = JS_NULL;
+                                        break;
+                                    case SqliteValueType::Integer: {
+                                        long long intVal = std::stoll(col.value);
+                                        jsValue = JS_NewInt64(g_ctx, intVal);
+                                        break; }
+                                    case SqliteValueType::Float: {
+                                        double floatVal = std::stod(col.value);
+                                        jsValue = JS_NewFloat64(g_ctx, floatVal);
+                                        break; }
+                                    case SqliteValueType::Text:
+                                        jsValue = JS_NewStringLen(g_ctx, col.value.data(), col.value.size());
+                                        break;
+                                    case SqliteValueType::Blob:
+                                        // For BLOB data, we'll return it as a string representation
+                                        // In a more sophisticated implementation, this could be a Uint8Array
+                                        jsValue = JS_NewStringLen(g_ctx, col.value.data(), col.value.size());
+                                        break;
                                 }
+                                JS_SetPropertyStr(g_ctx, obj, col.name.c_str(), jsValue);
                             }
                             JS_SetPropertyUint32(g_ctx, arr, idx++, obj);
                         }

@@ -98,7 +98,36 @@ static void request_callback (Http::Job job, RequestPromiseContext* pctx)
     delete pctx;
 }
 
-// JS: request({ url, method }) -> Promise<{ status, headers, body }>
+// Helper to convert JS object to httplib::Headers
+static httplib::Headers jsvalue_to_headers(JSContext* ctx, JSValueConst headers_val)
+{
+    httplib::Headers headers;
+    
+    if (JS_IsObject(headers_val)) {
+        JSPropertyEnum* props = nullptr;
+        uint32_t prop_count = 0;
+        
+        if (JS_GetOwnPropertyNames(ctx, &props, &prop_count, headers_val, JS_GPN_STRING_MASK) == 0) {
+            for (uint32_t i = 0; i < prop_count; i++) {
+                JSValue key_val = JS_AtomToValue(ctx, props[i].atom);
+                JSValue value_val = JS_GetProperty(ctx, headers_val, props[i].atom);
+                
+                std::string key = jsvalue_to_string(ctx, key_val);
+                std::string value = jsvalue_to_string(ctx, value_val);
+                
+                headers.insert({key, value});
+                
+                JS_FreeValue(ctx, key_val);
+                JS_FreeValue(ctx, value_val);
+            }
+            js_free(ctx, props);
+        }
+    }
+    
+    return headers;
+}
+
+// JS: request({ url, method, headers, body }) -> Promise<{ status, headers, body }>
 static JSValue js_request (JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv)
 {
     if (argc < 1 || !JS_IsObject(argv[0])) {
@@ -117,6 +146,16 @@ static JSValue js_request (JSContext* ctx, JSValueConst this_val, int argc, JSVa
     JS_FreeValue(ctx, method_val);
     Http::Method http_method = method_from_string(method);
 
+    // Extract headers
+    JSValue headers_val = JS_GetPropertyStr(ctx, argv[0], "headers");
+    httplib::Headers headers = jsvalue_to_headers(ctx, headers_val);
+    JS_FreeValue(ctx, headers_val);
+
+    // Extract body
+    JSValue body_val = JS_GetPropertyStr(ctx, argv[0], "body");
+    std::string body = jsvalue_to_string(ctx, body_val);
+    JS_FreeValue(ctx, body_val);
+
     // Create a Promise
     JSValue resolving_funcs[2];
     JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
@@ -129,7 +168,7 @@ static JSValue js_request (JSContext* ctx, JSValueConst this_val, int argc, JSVa
     // Queue the request
     http_instance.request(http_method, url, [pctx](Http::Job job) {
         request_callback(job, pctx);
-    });
+    }, headers, body);
 
     return promise;
 }

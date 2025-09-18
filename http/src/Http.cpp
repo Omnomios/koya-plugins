@@ -41,22 +41,38 @@ void Http::worker ()
             continue;
         }
 
+        httplib::Result res;
+
         if(matches[1].str() == "https")
         {
             httplib::SSLClient cli(matches[2].str(), 443);
 
-            httplib::Result res;
-
-            if((res = cli.Get(matches[3].str())))
+            // Execute the appropriate HTTP method
+            switch(job.method)
             {
-                job.succeed = true;
-                job.headers = res->headers;
-                job.status = res->status;
-                job.body = res->body;
+                case Method::Get:
+                    res = cli.Get(matches[3].str(), job.headers);
+                    break;
+                case Method::Post:
+                    res = cli.Post(matches[3].str(), job.headers, job.body, "application/json");
+                    break;
+                case Method::Put:
+                    res = cli.Put(matches[3].str(), job.headers, job.body, "application/json");
+                    break;
+                case Method::Patch:
+                    res = cli.Patch(matches[3].str(), job.headers, job.body, "application/json");
+                    break;
+                case Method::Delete:
+                    res = cli.Delete(matches[3].str(), job.headers);
+                    break;
+                default:
+                    job.succeed = false;
+                    this->done.push(job);
+                    continue;
             }
-            else
+
+            if(!res)
             {
-                job.succeed = false;
                 std::cout << "error code: " << res.error() << std::endl;
                 auto result = cli.get_openssl_verify_result();
                 if (result)
@@ -64,6 +80,57 @@ void Http::worker ()
                     std::cout << "verify error: " << X509_verify_cert_error_string(result) << std::endl;
                 }
             }
+        }
+        else if(matches[1].str() == "http")
+        {
+            httplib::Client cli(matches[2].str(), 80);
+
+            // Execute the appropriate HTTP method
+            switch(job.method)
+            {
+                case Method::Get:
+                    res = cli.Get(matches[3].str(), job.headers);
+                    break;
+                case Method::Post:
+                    res = cli.Post(matches[3].str(), job.headers, job.body, "application/json");
+                    break;
+                case Method::Put:
+                    res = cli.Put(matches[3].str(), job.headers, job.body, "application/json");
+                    break;
+                case Method::Patch:
+                    res = cli.Patch(matches[3].str(), job.headers, job.body, "application/json");
+                    break;
+                case Method::Delete:
+                    res = cli.Delete(matches[3].str(), job.headers);
+                    break;
+                default:
+                    job.succeed = false;
+                    this->done.push(job);
+                    continue;
+            }
+
+            if(!res)
+            {
+                std::cout << "error code: " << res.error() << std::endl;
+            }
+        }
+        else
+        {
+            job.succeed = false;
+            this->done.push(job);
+            continue;
+        }
+
+        if(res)
+        {
+            job.succeed = true;
+            job.headers = res->headers;
+            job.status = res->status;
+            job.body = res->body;
+        }
+        else
+        {
+            job.succeed = false;
         }
 
         this->done.push(job);

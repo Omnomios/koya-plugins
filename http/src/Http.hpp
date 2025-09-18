@@ -53,9 +53,15 @@ public:
     Http ();
     ~Http ();
 
-    void request (const Method& method, const std::string& url, std::function<void(Job)> callback)
+    void request (const Method& method, const std::string& url, std::function<void(Job)> callback, const httplib::Headers& headers = {}, const std::string& body = "")
     {
-        this->waiting.push({.method=method, .url=url, .complete=callback});
+        Job job;
+        job.method = method;
+        job.url = url;
+        job.complete = callback;
+        job.headers = headers;
+        job.body = body;
+        this->waiting.push(job);
         this->jobSignal.release();
     }
 
