@@ -45,6 +45,8 @@ import * as proc from 'Module/process';
 const p = proc.spawn({ cmd: 'bash', args: ['-lc', 'echo hi && sleep 1 && echo bye'] });
 p.stdout.on('data', chunk => print('out', chunk));
 p.on('exit', code => print('exit', code));
+const path = proc.getEnv('PATH', '/usr/bin');
+const allEnv = proc.env();
 ```
 
 SQLite:
@@ -69,7 +71,7 @@ sock.send('hello');
 - DBus: Background thread pumps messages; promises resolved during `update`.
 - HTTP: Async HTTP(S) requests with a worker thread and a small Promise API.
 - Hypr: IPC bridge to Hyprland sockets for events and commands/JSON queries.
-- Process: Spawn/exec with stdout/stderr streaming and an `exec()` Promise.
+- Process: Spawn/exec with stdout/stderr streaming, an `exec()` Promise, and access to environment variables.
 - SQLite: Async `exec()` and `query()` using a worker thread.
 - WebSocket: IXWebSocket wrapper with callbacks marshaled to the engine thread.
 

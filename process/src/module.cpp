@@ -29,6 +29,8 @@
 #include <memory>
 #include <unordered_map>
 #include <sstream>
+#include <cstring>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
@@ -36,6 +38,8 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fstream>
+#include <filesystem>
 
 #include "../../sdk/quickjs/quickjs.h"
 #include "../../module_hooks.h"
@@ -74,6 +78,8 @@ struct ExecRequest {
     JSValue reject;
 };
 static std::unordered_map<uint32_t, ExecRequest> g_exec_requests;
+
+extern char **environ;
 
 // Utility: convert JS string to std::string.
 static std::string js_to_std_string(JSContext* ctx, JSValueConst v) {
@@ -429,6 +435,177 @@ static JSValue js_read(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
     return obj;
 }
 
+// JS: writeFile(path, data) -> boolean (success)
+static JSValue js_write_file(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv)
+{
+    if (argc < 2) return JS_ThrowTypeError(ctx, "writeFile(path, data)");
+    
+    std::string path = js_to_std_string(ctx, argv[0]);
+    if (path.empty()) {
+        return JS_ThrowTypeError(ctx, "writeFile: path is required");
+    }
+
+    // Check if data is an ArrayBuffer (binary) or string
+    size_t len = 0;
+    uint8_t* data = (uint8_t*)JS_GetArrayBuffer(ctx, &len, argv[1]);
+    if (data) {
+        // Binary data (ArrayBuffer)
+        
+        try {
+            std::ofstream file(path, std::ios::binary);
+            if (!file.is_open()) {
+                return JS_NewBool(ctx, false);
+            }
+            file.write(reinterpret_cast<const char*>(data), len);
+            file.close();
+            return JS_NewBool(ctx, file.good());
+        } catch (const std::exception&) {
+            return JS_NewBool(ctx, false);
+        }
+    } else {
+        // String data
+        std::string data = js_to_std_string(ctx, argv[1]);
+        
+        try {
+            std::ofstream file(path);
+            if (!file.is_open()) {
+                return JS_NewBool(ctx, false);
+            }
+            file << data;
+            file.close();
+            return JS_NewBool(ctx, file.good());
+        } catch (const std::exception&) {
+            return JS_NewBool(ctx, false);
+        }
+    }
+}
+
+// JS: writeFileText(path, text) -> boolean (success)
+static JSValue js_write_file_text(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv)
+{
+    if (argc < 2) return JS_ThrowTypeError(ctx, "writeFileText(path, text)");
+    
+    std::string path = js_to_std_string(ctx, argv[0]);
+    std::string text = js_to_std_string(ctx, argv[1]);
+    
+    if (path.empty()) {
+        return JS_ThrowTypeError(ctx, "writeFileText: path is required");
+    }
+    
+    try {
+        std::ofstream file(path);
+        if (!file.is_open()) {
+            return JS_NewBool(ctx, false);
+        }
+        file << text;
+        file.close();
+        return JS_NewBool(ctx, file.good());
+    } catch (const std::exception&) {
+        return JS_NewBool(ctx, false);
+    }
+}
+
+// JS: mkdir(path) -> boolean (success)
+static JSValue js_mkdir(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv)
+{
+    if (argc < 1) return JS_ThrowTypeError(ctx, "mkdir(path)");
+    
+    std::string path = js_to_std_string(ctx, argv[0]);
+    if (path.empty()) {
+        return JS_ThrowTypeError(ctx, "mkdir: path is required");
+    }
+    
+    try {
+        bool success = std::filesystem::create_directories(path);
+        return JS_NewBool(ctx, success);
+    } catch (const std::exception&) {
+        return JS_NewBool(ctx, false);
+    }
+}
+
+// JS: exists(path) -> boolean
+static JSValue js_exists(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv)
+{
+    if (argc < 1) return JS_ThrowTypeError(ctx, "exists(path)");
+    
+    std::string path = js_to_std_string(ctx, argv[0]);
+    if (path.empty()) {
+        return JS_ThrowTypeError(ctx, "exists: path is required");
+    }
+    
+    try {
+        bool exists = std::filesystem::exists(path);
+        return JS_NewBool(ctx, exists);
+    } catch (const std::exception&) {
+        return JS_NewBool(ctx, false);
+    }
+}
+
+// JS: getEnv(name[, defaultValue]) -> string | undefined | defaultValue
+static JSValue js_get_env(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv)
+{
+    (void)this_val;
+    if (argc < 1 || !JS_IsString(argv[0])) {
+        return JS_ThrowTypeError(ctx, "getEnv(name[, defaultValue])");
+    }
+
+    std::string name = js_to_std_string(ctx, argv[0]);
+    if (name.empty()) {
+        if (argc >= 2) {
+            return JS_DupValue(ctx, argv[1]);
+        }
+        return JS_UNDEFINED;
+    }
+
+    const char* value = std::getenv(name.c_str());
+    if (value) {
+        return JS_NewString(ctx, value);
+    }
+
+    if (argc >= 2) {
+        return JS_DupValue(ctx, argv[1]);
+    }
+
+    return JS_UNDEFINED;
+}
+
+// JS: env() -> object mapping environment variable names to strings
+static JSValue js_env(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv)
+{
+    (void)this_val;
+    if (argc > 0) {
+        return JS_ThrowTypeError(ctx, "env() takes no arguments");
+    }
+
+    JSValue obj = JS_NewObject(ctx);
+    if (JS_IsException(obj)) {
+        return obj;
+    }
+
+    if (!environ) {
+        return obj;
+    }
+
+    for (char** env = environ; *env; ++env) {
+        const char* entry = *env;
+        const char* eq = std::strchr(entry, '=');
+        if (!eq || eq == entry) {
+            continue;
+        }
+        size_t key_len = static_cast<size_t>(eq - entry);
+        std::string key(entry, key_len);
+        const char* val = eq + 1;
+        JSValue val_js = JS_NewStringLen(ctx, val, std::strlen(val));
+        if (JS_IsException(val_js)) {
+            JS_FreeValue(ctx, obj);
+            return val_js;
+        }
+        JS_SetPropertyStr(ctx, obj, key.c_str(), val_js);
+    }
+
+    return obj;
+}
+
 // JS: exec(command) -> Promise<{ stdout, stderr }> and proper error object on failure.
 static JSValue js_exec(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv)
 {
@@ -484,6 +661,12 @@ static int process_module_init(JSContext* ctx, JSModuleDef* m)
 {
     JS_SetModuleExport(ctx, m, "spawn", JS_NewCFunction(ctx, js_spawn, "spawn", 1));
     JS_SetModuleExport(ctx, m, "exec", JS_NewCFunction(ctx, js_exec, "exec", 1));
+    JS_SetModuleExport(ctx, m, "writeFile", JS_NewCFunction(ctx, js_write_file, "writeFile", 2));
+    JS_SetModuleExport(ctx, m, "writeFileText", JS_NewCFunction(ctx, js_write_file_text, "writeFileText", 2));
+    JS_SetModuleExport(ctx, m, "mkdir", JS_NewCFunction(ctx, js_mkdir, "mkdir", 1));
+    JS_SetModuleExport(ctx, m, "exists", JS_NewCFunction(ctx, js_exists, "exists", 1));
+    JS_SetModuleExport(ctx, m, "getEnv", JS_NewCFunction(ctx, js_get_env, "getEnv", 2));
+    JS_SetModuleExport(ctx, m, "env", JS_NewCFunction(ctx, js_env, "env", 0));
     return 0;
 }
 
@@ -662,7 +845,13 @@ JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFu
     if(!m) return nullptr;
     JS_AddModuleExport(ctx, m, "spawn");
     JS_AddModuleExport(ctx, m, "exec");
+    JS_AddModuleExport(ctx, m, "writeFile");
+    JS_AddModuleExport(ctx, m, "writeFileText");
+    JS_AddModuleExport(ctx, m, "mkdir");
+    JS_AddModuleExport(ctx, m, "exists");
     JS_AddModuleExport(ctx, m, "drain");
+    JS_AddModuleExport(ctx, m, "getEnv");
+    JS_AddModuleExport(ctx, m, "env");
     return m;
 }
 }

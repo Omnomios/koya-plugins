@@ -84,8 +84,19 @@ static void request_callback (Http::Job job, RequestPromiseContext* pctx)
     }
     JS_SetPropertyStr(ctx, result, "headers", headers);
 
-    // body
-    JS_SetPropertyStr(ctx, result, "body", JS_NewString(ctx, job.body.c_str()));
+    // body (text or binary based on job.binary)
+    if (job.binary) {
+        // Return binary data as ArrayBuffer
+        if (!job.bodyBinary.empty()) {
+            JSValue arrayBuffer = JS_NewArrayBufferCopy(ctx, job.bodyBinary.data(), job.bodyBinary.size());
+            JS_SetPropertyStr(ctx, result, "body", arrayBuffer);
+        } else {
+            JS_SetPropertyStr(ctx, result, "body", JS_NULL);
+        }
+    } else {
+        // Return text data as string
+        JS_SetPropertyStr(ctx, result, "body", JS_NewString(ctx, job.body.c_str()));
+    }
 
     if (job.succeed) {
         JS_Call(ctx, pctx->resolve, JS_UNDEFINED, 1, &result);
@@ -127,7 +138,7 @@ static httplib::Headers jsvalue_to_headers(JSContext* ctx, JSValueConst headers_
     return headers;
 }
 
-// JS: request({ url, method, headers, body }) -> Promise<{ status, headers, body }>
+// JS: request({ url, method, headers, body, binary? }) -> Promise<{ status, headers, body }>
 static JSValue js_request (JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv)
 {
     if (argc < 1 || !JS_IsObject(argv[0])) {
@@ -156,6 +167,11 @@ static JSValue js_request (JSContext* ctx, JSValueConst this_val, int argc, JSVa
     std::string body = jsvalue_to_string(ctx, body_val);
     JS_FreeValue(ctx, body_val);
 
+    // Extract binary option
+    JSValue binary_val = JS_GetPropertyStr(ctx, argv[0], "binary");
+    bool binary = JS_ToBool(ctx, binary_val);
+    JS_FreeValue(ctx, binary_val);
+
     // Create a Promise
     JSValue resolving_funcs[2];
     JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
@@ -168,10 +184,11 @@ static JSValue js_request (JSContext* ctx, JSValueConst this_val, int argc, JSVa
     // Queue the request
     http_instance.request(http_method, url, [pctx](Http::Job job) {
         request_callback(job, pctx);
-    }, headers, body);
+    }, headers, body, binary);
 
     return promise;
 }
+
 
 // JS: drain() — manual pump; also wired to Koya's update hook.
 static JSValue js_drain (JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv)

@@ -41,11 +41,13 @@ public:
         Method method = Method::Get;
         std::string url;
         bool succeed = false;
+        bool binary = false;
 
         std::function<void(Job)> complete;
 
         httplib::Headers headers;
         std::string body;
+        std::vector<uint8_t> bodyBinary;
         int status = 0;
     };
 
@@ -53,7 +55,7 @@ public:
     Http ();
     ~Http ();
 
-    void request (const Method& method, const std::string& url, std::function<void(Job)> callback, const httplib::Headers& headers = {}, const std::string& body = "")
+    void request (const Method& method, const std::string& url, std::function<void(Job)> callback, const httplib::Headers& headers = {}, const std::string& body = "", bool binary = false)
     {
         Job job;
         job.method = method;
@@ -61,6 +63,7 @@ public:
         job.complete = callback;
         job.headers = headers;
         job.body = body;
+        job.binary = binary;
         this->waiting.push(job);
         this->jobSignal.release();
     }

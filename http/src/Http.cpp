@@ -127,6 +127,8 @@ void Http::worker ()
             job.headers = res->headers;
             job.status = res->status;
             job.body = res->body;
+            // Store binary data as well
+            job.bodyBinary.assign(res->body.begin(), res->body.end());
         }
         else
         {

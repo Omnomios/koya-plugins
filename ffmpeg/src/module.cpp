@@ -85,6 +85,49 @@ static inline std::string make_stream_id(uint32_t windowId, const std::string& k
     return std::to_string(windowId) + "|" + key;
 }
 
+static void teardown_stream(VideoStream* s)
+{
+    if(!s) return;
+    s->running.store(false);
+    s->playing.store(false);
+    if(s->worker.joinable())
+    {
+        s->worker.join();
+    }
+    if(s->sws)
+    {
+        sws_freeContext(s->sws);
+        s->sws = nullptr;
+    }
+    if(s->codec)
+    {
+        avcodec_free_context(&s->codec);
+    }
+    if(s->fmt)
+    {
+        avformat_close_input(&s->fmt);
+    }
+    if(s->usingMemAvio)
+    {
+        if(s->avio)
+        {
+            if(s->avio->buffer) av_free(s->avio->buffer);
+            avio_context_free(&s->avio);
+        }
+        if(s->avioOpaque)
+        {
+            std::free(s->avioOpaque);
+            s->avioOpaque = nullptr;
+        }
+        if(s->assetBuf && g_renderer && g_renderer->asset_free_buffer)
+        {
+            g_renderer->asset_free_buffer((void*)g_renderer->ctx, s->assetBuf);
+            s->assetBuf = nullptr;
+            s->assetSize = 0;
+        }
+    }
+}
+
 // JS: load(windowId, key, path)
 static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv)
 {
@@ -93,14 +136,14 @@ static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
     const char* k = JS_ToCString(ctx, argv[1]); if(!k) return JS_EXCEPTION;
     const char* vpath = JS_ToCString(ctx, argv[2]); if(!vpath) { JS_FreeCString(ctx, k); return JS_EXCEPTION; }
 
-    // Prevent duplicate loads for the same windowId|key
+    std::string streamId = make_stream_id(windowId, k);
     {
         std::lock_guard<std::mutex> lk(g_mutex);
-        if(g_streams.find(make_stream_id(windowId, k)) != g_streams.end())
+        auto it = g_streams.find(streamId);
+        if(it != g_streams.end())
         {
-            JS_FreeCString(ctx, vpath);
-            JS_FreeCString(ctx, k);
-            return JS_ThrowInternalError(ctx, "stream already loaded");
+            teardown_stream(it->second.get());
+            g_streams.erase(it);
         }
     }
 
@@ -317,7 +360,7 @@ static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
     // Store under composite key (windowId|key) to prevent cross-window collisions
     {
         std::lock_guard<std::mutex> lk(g_mutex);
-        g_streams[make_stream_id(windowId, vs->key)] = std::move(vs);
+        g_streams[streamId] = std::move(vs);
     }
     return JS_UNDEFINED;
 }
@@ -328,30 +371,12 @@ static JSValue js_stop(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
     if(argc < 2) return JS_ThrowTypeError(ctx, "stop(windowId, key)");
     uint32_t windowId = 0; JS_ToUint32(ctx, &windowId, argv[0]);
     const char* k = JS_ToCString(ctx, argv[1]); if(!k) return JS_EXCEPTION;
-    std::unique_ptr<VideoStream> victim;
     {
         std::lock_guard<std::mutex> lk(g_mutex);
         auto it = g_streams.find(make_stream_id(windowId, k));
-        if(it != g_streams.end()) {
-            it->second->running.store(false);
-            if(it->second->worker.joinable()) it->second->worker.join();
-            if(it->second->sws) { sws_freeContext(it->second->sws); it->second->sws = nullptr; }
-            if(it->second->codec) { avcodec_free_context(&it->second->codec); }
-            if(it->second->fmt) { avformat_close_input(&it->second->fmt); }
-            if(it->second->usingMemAvio)
-            {
-                if(it->second->avio) {
-                    if(it->second->avio->buffer) av_free(it->second->avio->buffer);
-                    avio_context_free(&it->second->avio);
-                }
-                if(it->second->avioOpaque) { std::free(it->second->avioOpaque); it->second->avioOpaque = nullptr; }
-                if(it->second->assetBuf && g_renderer && g_renderer->asset_free_buffer)
-                {
-                    g_renderer->asset_free_buffer((void*)g_renderer->ctx, it->second->assetBuf);
-                    it->second->assetBuf = nullptr; it->second->assetSize = 0;
-                }
-            }
-            victim = std::move(it->second);
+        if(it != g_streams.end())
+        {
+            teardown_stream(it->second.get());
             g_streams.erase(it);
         }
     }
@@ -493,24 +518,7 @@ static void ffmpeg_cleanup(void* /*data*/)
     // Helper to stop and free a single stream
     auto stop_stream = [] (std::unique_ptr<VideoStream>& s) {
         if(!s) return;
-        s->running.store(false);
-        if(s->worker.joinable()) s->worker.join();
-        if(s->sws) { sws_freeContext(s->sws); s->sws = nullptr; }
-        if(s->codec) { avcodec_free_context(&s->codec); }
-        if(s->fmt) { avformat_close_input(&s->fmt); }
-        if(s->usingMemAvio)
-        {
-            if(s->avio) {
-                if(s->avio->buffer) av_free(s->avio->buffer);
-                avio_context_free(&s->avio);
-            }
-            if(s->avioOpaque) { std::free(s->avioOpaque); s->avioOpaque = nullptr; }
-            if(s->assetBuf && g_renderer && g_renderer->asset_free_buffer)
-            {
-                g_renderer->asset_free_buffer((void*)g_renderer->ctx, s->assetBuf);
-                s->assetBuf = nullptr; s->assetSize = 0;
-            }
-        }
+        teardown_stream(s.get());
         s.reset();
     };
     for(auto& kv : local) stop_stream(kv.second);
