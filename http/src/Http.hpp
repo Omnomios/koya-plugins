@@ -42,6 +42,7 @@ public:
         std::string url;
         bool succeed = false;
         bool binary = false;
+        std::string errorMessage;
 
         std::function<void(Job)> complete;
 

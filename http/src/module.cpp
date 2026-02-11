@@ -72,38 +72,45 @@ struct RequestPromiseContext {
 static void request_callback (Http::Job job, RequestPromiseContext* pctx)
 {
     JSContext* ctx = pctx->ctx;
-    JSValue result = JS_NewObject(ctx);
-
-    // status
-    JS_SetPropertyStr(ctx, result, "status", JS_NewInt32(ctx, job.status));
-
-    // headers
-    JSValue headers = JS_NewObject(ctx);
-    for (const auto& h : job.headers) {
-        JS_SetPropertyStr(ctx, headers, h.first.c_str(), JS_NewString(ctx, h.second.c_str()));
-    }
-    JS_SetPropertyStr(ctx, result, "headers", headers);
-
-    // body (text or binary based on job.binary)
-    if (job.binary) {
-        // Return binary data as ArrayBuffer
-        if (!job.bodyBinary.empty()) {
-            JSValue arrayBuffer = JS_NewArrayBufferCopy(ctx, job.bodyBinary.data(), job.bodyBinary.size());
-            JS_SetPropertyStr(ctx, result, "body", arrayBuffer);
-        } else {
-            JS_SetPropertyStr(ctx, result, "body", JS_NULL);
-        }
-    } else {
-        // Return text data as string
-        JS_SetPropertyStr(ctx, result, "body", JS_NewString(ctx, job.body.c_str()));
-    }
 
     if (job.succeed) {
-        JS_Call(ctx, pctx->resolve, JS_UNDEFINED, 1, &result);
+        JSValue result = JS_NewObject(ctx);
+
+        // status
+        JS_SetPropertyStr(ctx, result, "status", JS_NewInt32(ctx, job.status));
+
+        // headers
+        JSValue headers = JS_NewObject(ctx);
+        for (const auto& h : job.headers) {
+            JS_SetPropertyStr(ctx, headers, h.first.c_str(), JS_NewString(ctx, h.second.c_str()));
+        }
+        JS_SetPropertyStr(ctx, result, "headers", headers);
+
+        // body (text or binary based on job.binary)
+        if (job.binary) {
+            // Return binary data as ArrayBuffer
+            if (!job.bodyBinary.empty()) {
+                JSValue arrayBuffer = JS_NewArrayBufferCopy(ctx, job.bodyBinary.data(), job.bodyBinary.size());
+                JS_SetPropertyStr(ctx, result, "body", arrayBuffer);
+            } else {
+                JS_SetPropertyStr(ctx, result, "body", JS_NULL);
+            }
+        } else {
+            // Return text data as string
+            JS_SetPropertyStr(ctx, result, "body", JS_NewString(ctx, job.body.c_str()));
+        }
+
+        JSValue ret = JS_Call(ctx, pctx->resolve, JS_UNDEFINED, 1, &result);
+        JS_FreeValue(ctx, result);
+        JS_FreeValue(ctx, ret);
     } else {
-        JS_Call(ctx, pctx->reject, JS_UNDEFINED, 1, &result);
+        std::string errorMsg = job.errorMessage.empty() ? "HTTP request failed" : job.errorMessage;
+        JS_ThrowInternalError(ctx, "%s", errorMsg.c_str());
+        JSValue error = JS_GetException(ctx);
+        JSValue ret = JS_Call(ctx, pctx->reject, JS_UNDEFINED, 1, &error);
+        JS_FreeValue(ctx, error);
+        JS_FreeValue(ctx, ret);
     }
-    JS_FreeValue(ctx, result);
     JS_FreeValue(ctx, pctx->resolve);
     JS_FreeValue(ctx, pctx->reject);
     delete pctx;

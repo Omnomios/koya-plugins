@@ -303,9 +303,9 @@ static void worker_thread_body() {
                         JSValue ret = JS_Call(g_ctx, resolve, JS_UNDEFINED, 1, &undef);
                         JS_FreeValue(g_ctx, ret);
                     } else {
-                        JSValue err = JS_NewObject(g_ctx);
-                        JS_SetPropertyStr(g_ctx, err, "message", JS_NewString(g_ctx, res.message.c_str()));
-                        JS_SetPropertyStr(g_ctx, err, "code", JS_NewInt32(g_ctx, res.code));
+                        std::string msg = res.message.empty() ? "sqlite exec failed" : res.message;
+                        JS_ThrowInternalError(g_ctx, "%s (code %d)", msg.c_str(), res.code);
+                        JSValue err = JS_GetException(g_ctx);
                         JSValue ret = JS_Call(g_ctx, reject, JS_UNDEFINED, 1, &err);
                         JS_FreeValue(g_ctx, err);
                         JS_FreeValue(g_ctx, ret);
@@ -417,9 +417,9 @@ static void worker_thread_body() {
                         JS_FreeValue(g_ctx, arr);
                         JS_FreeValue(g_ctx, ret);
                     } else {
-                        JSValue err = JS_NewObject(g_ctx);
-                        JS_SetPropertyStr(g_ctx, err, "message", JS_NewString(g_ctx, res.message.c_str()));
-                        JS_SetPropertyStr(g_ctx, err, "code", JS_NewInt32(g_ctx, res.code));
+                        std::string msg = res.message.empty() ? "sqlite query failed" : res.message;
+                        JS_ThrowInternalError(g_ctx, "%s (code %d)", msg.c_str(), res.code);
+                        JSValue err = JS_GetException(g_ctx);
                         JSValue ret = JS_Call(g_ctx, reject, JS_UNDEFINED, 1, &err);
                         JS_FreeValue(g_ctx, err);
                         JS_FreeValue(g_ctx, ret);

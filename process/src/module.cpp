@@ -740,7 +740,6 @@ static void process_update_callback(void* /*data*/)
     }
     for (auto &f : finals) {
         if (f.ok) {
-            // Resolve with { stdout, stderr }
             JSValue resObj = JS_NewObject(g_ctx);
             JS_SetPropertyStr(g_ctx, resObj, "stdout", JS_NewStringLen(g_ctx, f.out.data(), f.out.size()));
             JS_SetPropertyStr(g_ctx, resObj, "stderr", JS_NewStringLen(g_ctx, f.err.data(), f.err.size()));
@@ -748,12 +747,14 @@ static void process_update_callback(void* /*data*/)
             JS_FreeValue(g_ctx, resObj);
             JS_FreeValue(g_ctx, ret);
         } else {
-            JSValue errObj = JS_NewObject(g_ctx);
             std::string msg = std::string("exec failed with code ") + std::to_string(f.code);
-            JS_SetPropertyStr(g_ctx, errObj, "message", JS_NewString(g_ctx, msg.c_str()));
+            JS_ThrowInternalError(g_ctx, "%s", msg.c_str());
+            JSValue errObj = JS_GetException(g_ctx);
+
             JS_SetPropertyStr(g_ctx, errObj, "code", JS_NewInt32(g_ctx, f.code));
             JS_SetPropertyStr(g_ctx, errObj, "stdout", JS_NewStringLen(g_ctx, f.out.data(), f.out.size()));
             JS_SetPropertyStr(g_ctx, errObj, "stderr", JS_NewStringLen(g_ctx, f.err.data(), f.err.size()));
+
             JSValue ret = JS_Call(g_ctx, f.reject, JS_UNDEFINED, 1, &errObj);
             JS_FreeValue(g_ctx, errObj);
             JS_FreeValue(g_ctx, ret);

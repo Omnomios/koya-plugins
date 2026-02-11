@@ -37,6 +37,7 @@ void Http::worker ()
         if(!std::regex_search(job.url, matches, urlPattern))
         {
             job.succeed = false;
+            job.errorMessage = "Invalid URL format";
             this->done.push(job);
             continue;
         }
@@ -67,17 +68,22 @@ void Http::worker ()
                     break;
                 default:
                     job.succeed = false;
+                    job.errorMessage = "Unsupported HTTP method";
                     this->done.push(job);
                     continue;
             }
 
             if(!res)
             {
+                std::string errorStr = httplib::to_string(res.error());
                 std::cout << "error code: " << res.error() << std::endl;
+                job.errorMessage = errorStr;
                 auto result = cli.get_openssl_verify_result();
                 if (result)
                 {
-                    std::cout << "verify error: " << X509_verify_cert_error_string(result) << std::endl;
+                    std::string sslError = X509_verify_cert_error_string(result);
+                    std::cout << "verify error: " << sslError << std::endl;
+                    job.errorMessage += " (SSL: " + sslError + ")";
                 }
             }
         }
@@ -105,18 +111,22 @@ void Http::worker ()
                     break;
                 default:
                     job.succeed = false;
+                    job.errorMessage = "Unsupported HTTP method";
                     this->done.push(job);
                     continue;
             }
 
             if(!res)
             {
+                std::string errorStr = httplib::to_string(res.error());
                 std::cout << "error code: " << res.error() << std::endl;
+                job.errorMessage = errorStr;
             }
         }
         else
         {
             job.succeed = false;
+            job.errorMessage = "Unsupported URL scheme (only http:// and https:// are supported)";
             this->done.push(job);
             continue;
         }
@@ -133,6 +143,10 @@ void Http::worker ()
         else
         {
             job.succeed = false;
+            if(job.errorMessage.empty())
+            {
+                job.errorMessage = "HTTP request failed";
+            }
         }
 
         this->done.push(job);
