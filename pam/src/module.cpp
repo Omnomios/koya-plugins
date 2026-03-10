@@ -232,8 +232,8 @@ JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFu
         g_worker = std::thread(worker_loop);
         g_worker.detach();
     }
-    registerHook("update", pam_update);
-    registerHook("cleanup", [](void*){
+    registerHook("script:update", pam_update);
+    registerHook("script:cleanup", [](void*){
         g_running.store(false);
         g_reqCv.notify_all();
         {

@@ -230,8 +230,8 @@ extern "C" {
 // Required entry point
 JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*) {
     g_ctx = ctx;
-        // Hook: update — runs completions (Promise resolve/reject) on engine thread.
-        registerHook("update", [](void*){
+        // Hook: script:update — runs completions (Promise resolve/reject) on script thread.
+        registerHook("script:update", [](void*){
         std::queue<std::function<void()>> local;
         {
             std::lock_guard<std::mutex> lk(g_comp_mutex);
@@ -239,7 +239,7 @@ JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFu
         }
         while(!local.empty()) { local.front()(); local.pop(); }
     });
-    registerHook("cleanup", [](void*){
+    registerHook("script:cleanup", [](void*){
         g_worker_running = false;
         g_job_cv.notify_all();
         if (g_worker.joinable()) g_worker.join();

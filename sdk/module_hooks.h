@@ -4,7 +4,10 @@
 extern "C" {
 #endif
 
-// Function pointer type for hook callbacks
+// Function pointer type for hook callbacks.
+// Hook names prefixed with `script:` are invoked on the scripting thread and
+// always receive `data == nullptr`.
+// Other hook names are invoked on the engine thread.
 typedef void (*HookCallback)(void* data);
 
 // Function pointer type for the registration function passed to integrate()

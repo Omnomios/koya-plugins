@@ -8,7 +8,7 @@
    Koya vs Application responsibilities:
    - Koya provides:
      - The QuickJS context (`JSContext*`) and module system
-     - The hook system (`registerHook("update" | "cleanup", fn)`) to run work on the
+     - The hook system (`registerHook("script:update" | "script:cleanup", fn)`) to run work on the
        engine thread
    - This plugin provides (application):
      - A background pump thread that reads DBus messages and queues results
@@ -1116,8 +1116,8 @@ extern "C" {
 // Required entry point
 JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*) {
     g_ctx = ctx;
-    registerHook("update", dbus_update);
-    registerHook("cleanup", [](void*){
+    registerHook("script:update", dbus_update);
+    registerHook("script:cleanup", [](void*){
         // Stop pump loop
         g_running.store(false);
         g_connecting.store(false);

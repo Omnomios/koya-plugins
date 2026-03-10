@@ -14,7 +14,7 @@
 
    Integration pattern:
    - Create a module with `JS_NewCModule` and expose C functions as exports.
-   - Use `registerHook("update", ...)` to marshal results back onto the JS thread.
+   - Use `registerHook("script:update", ...)` to marshal results back onto the script thread.
 */
 #include "Http.hpp"
 #include "httplib.h"
@@ -212,7 +212,7 @@ static int js_http_init (JSContext* ctx, JSModuleDef* m)
     return 0;
 }
 
-// Update hook callback for the HTTP module (handles drain)
+// Script update hook callback for the HTTP module (handles drain)
 void http_update_callback(void* data)
 {
     http_instance.drain();
@@ -222,8 +222,8 @@ extern "C" {
 // Required entry point
 JSModuleDef* integrateV1 (JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*)
 {
-    // Register our update hook callback with the engine
-    registerHook("update", http_update_callback);
+    // Register our script-update hook callback
+    registerHook("script:update", http_update_callback);
 
     JSModuleDef *m = JS_NewCModule(ctx, module_name, js_http_init);
     if(!m)

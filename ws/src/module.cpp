@@ -392,8 +392,8 @@ JSModuleDef* integrateV1 ( JSContext* ctx, const char* module_name, RegisterHook
     // Store the context for use in update callback
     g_ws_ctx = ctx;
 
-    // Register our update hook callback with the engine
-    registerHook("update", ws_update_callback);
+    // Register our script-update hook callback
+    registerHook("script:update", ws_update_callback);
 
     JSModuleDef* m = JS_NewCModule(ctx, module_name, ws_module_init);
     if(!m) return nullptr;

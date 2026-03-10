@@ -491,9 +491,9 @@ extern "C" {
 // Required entry point
 JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*) {
     g_ctx = ctx;
-    registerHook("update", hypr_update_callback);
+    registerHook("script:update", hypr_update_callback);
     // Ensure we release all JS references and stop background work on engine shutdown
-    registerHook("cleanup", [](void* /*data*/){
+    registerHook("script:cleanup", [](void* /*data*/){
         // Signal background thread to stop
         g_running.store(false);
         // Best-effort: drop any queued events

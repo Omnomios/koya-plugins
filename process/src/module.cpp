@@ -788,15 +788,15 @@ static void process_update_callback(void* /*data*/)
 extern "C" {
 // How to extend:
 // - Export `integrateV1` from your shared library.
-// - Wire an `update` hook to deliver cross-thread events back to JS.
-// - Wire a `cleanup` hook to release OS handles and JS references.
+// - Wire a `script:update` hook to deliver cross-thread events back to JS.
+// - Wire a `script:cleanup` hook to release OS handles and JS references.
 // - Create your JS module and list named exports with JS_AddModuleExport.
 JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*)
 {
     g_ctx = ctx;
-    registerHook("update", process_update_callback);
+    registerHook("script:update", process_update_callback);
     // Ensure we release all JSValue references and OS resources on engine cleanup
-    registerHook("cleanup", [](void* /*data*/){
+    registerHook("script:cleanup", [](void* /*data*/){
         // Free pending exec resolve/reject functions
         {
             std::lock_guard<std::mutex> lk(g_proc_mutex);
