@@ -9,9 +9,18 @@ This repository showcases native plugins that extend the Koya runtime with syste
 
 Typical shape of a plugin: export `integrateV1(JSContext*, const char*, RegisterHookFunc, const KoyaRendererV1*)` which:
 
-- Registers `update` (and optionally `cleanup`) using the provided `RegisterHookFunc`.
+- Registers hooks using the provided `RegisterHookFunc`.
 - Creates a JS module via `JS_NewCModule` and exports your API functions.
-- Keeps blocking or async work off the engine thread; drains results in `update`.
+- Keeps blocking or async work off the engine thread; drains results on the appropriate hook thread.
+
+### Migration notice (thread split)
+
+Koya's scripting runtime now runs on a dedicated script thread. Plugin hooks are now split by name:
+
+- `update`, `cleanup`, `render_begin`, etc. run on the engine thread.
+- `script:update` and `script:cleanup` run on the script thread and are intended for QuickJS API use (Promise settle, callback invocation, JSValue cleanup).
+
+If your plugin calls QuickJS APIs (`JS_Call`, `JS_FreeValue`, `JS_Throw*`, etc.) from hook callbacks, migrate those callbacks to `script:update` / `script:cleanup`.
 
 ### Quick usage examples
 
@@ -68,7 +77,7 @@ sock.send('hello');
 
 ### Included plugins
 
-- DBus: Background thread pumps messages; promises resolved during `update`.
+- DBus: Background thread pumps messages; promises resolved during `script:update`.
 - HTTP: Async HTTP(S) requests with a worker thread and a small Promise API.
 - Hypr: IPC bridge to Hyprland sockets for events and commands/JSON queries.
 - Process: Spawn/exec with stdout/stderr streaming, an `exec()` Promise, and access to environment variables.
@@ -91,7 +100,7 @@ These are native modules intended to extend a binary distribution of Koya. You d
 1. Copy a minimal module (e.g., `sqlite/src/module.cpp`).
 2. Implement `integrateV1(...)`, create a JS module with `JS_NewCModule`, and export your API with `JS_SetModuleExport` + `JS_AddModuleExport`.
 3. Keep blocking/async work off-thread; queue results from workers.
-4. Drain queues and settle Promises in the `update` or `render_begin` hook. Release all JS values and OS resources in `cleanup`.
+4. Drain queues and settle Promises in `script:update` if you touch QuickJS values. Keep renderer/engine work in engine hooks like `update`/`render_begin`. Release JS values in `script:cleanup` and native resources in `cleanup` as needed.
 5. Build as a shared library; place it where the Koya binary expects modules.
 
 Koya website: [koya-ui.com](https://www.koya-ui.com)
