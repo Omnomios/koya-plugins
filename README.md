@@ -91,7 +91,15 @@ Vendored dependencies live under folders like `IXWebSocket/` or `cpp-httplib/`. 
 These are native modules intended to extend a binary distribution of Koya. You don't need Koya's source to build them.
 
 - Ensure you have the Koya SDK bits available at build time: QuickJS headers and the `module_hooks.h` interface (see `sdk/quickjs/` and `module_hooks.h` in this repo).
-- Use the provided `CMakeLists.txt` in each plugin to build a shared library.
+- Use Meson from repo root to build all plugins:
+
+```bash
+meson setup build --buildtype=debug
+meson compile -C build -j$(nproc)
+```
+
+- Built modules are produced in `build/<plugin>/` (for example `build/http/libsm-http.so`).
+- CMake files remain available as fallback per-plugin if needed.
 - The output is a shared object exposing `integrateV1(JSContext*, const char*, RegisterHookFunc, const KoyaRendererV1*)` that Koya can discover and load.
 - Consult Koya's distribution docs for where to place the built module and how it is discovered at runtime.
 
