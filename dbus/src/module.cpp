@@ -8,7 +8,7 @@
    Koya vs Application responsibilities:
    - Koya provides:
      - The QuickJS context (`JSContext*`) and module system
-     - The hook system (`registerHook("script:update" | "script:cleanup", fn)`) to run work on the
+     - The hook system (`registerHook("update" | "cleanup", fn)`) to run work on the
        engine thread
    - This plugin provides (application):
      - A background pump thread that reads DBus messages and queues results
@@ -19,7 +19,7 @@
        - onSignal(cb), offSignal(cb?)
 
    Integration points you can copy for your own plugins:
-   - `integrate(JSContext*, const char*, RegisterHookFunc)` creates a JS module and
+   - the canonical integration entry point creates a JS module and
      registers hooks via the provided `registerHook` function.
    - The `update` hook drains cross-thread queues and resolves JS Promises on the
      Koya/JS thread. The `cleanup` hook shuts down threads and releases JS values.
@@ -47,7 +47,7 @@
 #include <dbus/dbus.h>
 
 #include "../../sdk/quickjs/quickjs.h"
-#include "../../sdk/module_hooks.h"
+#include "../../sdk/plugin_support.hpp"
 
 namespace {
 
@@ -84,33 +84,61 @@ struct SignalItem {
     std::string body; // simple debug string; consumers can parse further
 };
 
-static std::atomic<uint32_t> g_nextId{1};
-static std::mutex g_promMutex;
-static std::unordered_map<uint32_t, PendingPromise> g_promises;
-// Map DBus reply serial -> our promise id for correct correlation
-static std::mutex g_serialMapMutex;
-static std::unordered_map<uint32_t, uint32_t> g_serialToPromiseId;
-static std::mutex g_replyMutex;
-static std::queue<ReplyItem> g_replies;
-static std::mutex g_sigMutex;
-static std::queue<SignalItem> g_signals;
+struct DbusState {
+    std::atomic<uint32_t> nextId{1};
+    std::mutex promiseMutex;
+    std::unordered_map<uint32_t, PendingPromise> promises;
+    std::mutex serialMapMutex;
+    std::unordered_map<uint32_t, uint32_t> serialToPromiseId;
+    std::mutex replyMutex;
+    std::queue<ReplyItem> replies;
+    std::mutex signalMutex;
+    std::queue<SignalItem> signals;
+    std::mutex callbackMutex;
+    std::vector<JSValue> signalCallbacks;
+    JSContext* context = nullptr;
+    std::thread connectThread;
+    std::thread pumpThread;
+    std::atomic<bool> running{false};
+    std::atomic<bool> connecting{false};
+    std::atomic<bool> shuttingDown{false};
+    DBusConnection* connection = nullptr;
+    BusType busType = BusType::Session;
+    std::mutex connectWaitersMutex;
+    std::vector<uint32_t> connectWaiterIds;
+    std::mutex busIoMutex;
+    bool debug = false;
+};
 
-static std::mutex g_cbMutex;
-static std::vector<JSValue> g_signalCallbacks;
+static std::once_flag dbusThreadsOnce;
+static thread_local DbusState* dbusState = nullptr;
 
-static JSContext* g_ctx = nullptr;
+#define g_nextId (dbusState->nextId)
+#define g_promMutex (dbusState->promiseMutex)
+#define g_promises (dbusState->promises)
+#define g_serialMapMutex (dbusState->serialMapMutex)
+#define g_serialToPromiseId (dbusState->serialToPromiseId)
+#define g_replyMutex (dbusState->replyMutex)
+#define g_replies (dbusState->replies)
+#define g_sigMutex (dbusState->signalMutex)
+#define g_signals (dbusState->signals)
+#define g_cbMutex (dbusState->callbackMutex)
+#define g_signalCallbacks (dbusState->signalCallbacks)
+#define g_ctx (dbusState->context)
+#define g_connectThread (dbusState->connectThread)
+#define g_pumpThread (dbusState->pumpThread)
+#define g_running (dbusState->running)
+#define g_conn (dbusState->connection)
+#define g_busType (dbusState->busType)
+#define g_connecting (dbusState->connecting)
+#define g_connectWaitersMutex (dbusState->connectWaitersMutex)
+#define g_connectWaiterIds (dbusState->connectWaiterIds)
+#define g_busIoMutex (dbusState->busIoMutex)
+#define g_debug (dbusState->debug)
 
-static std::thread g_pumpThread;
-static std::atomic<bool> g_running{false};
-static std::atomic<bool> g_threadsInited{false};
-static DBusConnection* g_conn = nullptr;
-static BusType g_busType = BusType::Session;
-static std::atomic<bool> g_connecting{false};
-static std::mutex g_connectWaitersMutex;
-static std::vector<uint32_t> g_connectWaiterIds;
-// Serialize bus I/O between sender and pump to avoid reply-mapping race
-static std::mutex g_busIoMutex;
-static bool g_debug = false;
+struct DbusPlugin : HelixPluginSupport {
+    DbusState runtime;
+};
 
 static std::string js_to_string(JSContext* ctx, JSValueConst v) {
     const char* c = JS_ToCString(ctx, v);
@@ -267,7 +295,8 @@ static uint64_t now_ms() {
 
 // Background I/O loop. Runs on g_pumpThread, pulls messages and enqueues
 // lightweight records for delivery during the `update` hook.
-static void pump_loop() {
+static void pump_loop(DbusState* state) {
+    dbusState = state;
     while (g_running.load()) {
         DBusConnection* conn = g_conn;
         if (!conn) break;
@@ -377,6 +406,7 @@ not_bytes_path:
             dbus_message_unref(msg);
         }
     }
+    dbusState = nullptr;
 }
 
 // JS: connect("session"|"system") — asynchronously connects to dbus on a worker
@@ -397,10 +427,7 @@ static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSVal
         return promise;
     }
     // Initialize libdbus threading once if using threads
-    bool expected = false;
-    if (g_threadsInited.compare_exchange_strong(expected, true)) {
-        dbus_threads_init_default();
-    }
+    std::call_once(dbusThreadsOnce, [] { dbus_threads_init_default(); });
     BusType type = BusType::Session;
     if (argc >= 1 && JS_IsString(argv[0])) {
         std::string t = js_to_string(ctx, argv[0]);
@@ -433,7 +460,10 @@ static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSVal
         return promise; // another connect is in flight; we'll resolve when it finishes
     }
 
-    std::thread([type]() {
+    if (g_connectThread.joinable()) g_connectThread.join();
+    DbusState* state = dbusState;
+    g_connectThread = std::thread([state, type]() {
+    dbusState = state;
     DBusError err; dbus_error_init(&err);
     DBusConnection* conn = dbus_bus_get(type == BusType::System ? DBUS_BUS_SYSTEM : DBUS_BUS_SESSION, &err);
     if (!conn) {
@@ -453,6 +483,13 @@ static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSVal
                 }
             }
             g_connecting.store(false);
+            dbusState = nullptr;
+            return;
+        }
+        if (dbusState->shuttingDown.load()) {
+            dbus_connection_unref(conn);
+            g_connecting.store(false);
+            dbusState = nullptr;
             return;
         }
         // Do not exit process on disconnect
@@ -463,7 +500,7 @@ static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSVal
         if (g_pumpThread.joinable()) {
             g_pumpThread.join();
         }
-        g_pumpThread = std::thread(pump_loop);
+        g_pumpThread = std::thread([state] { pump_loop(state); });
     }
         if (g_debug) fprintf(stderr, "dbus: connected to %s bus\n", type == BusType::System ? "system" : "session");
         // Notify all waiters of success
@@ -480,7 +517,8 @@ static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSVal
             }
         }
         g_connecting.store(false);
-    }).detach();
+        dbusState = nullptr;
+    });
 
     return promise;
 }
@@ -1001,7 +1039,7 @@ static void dbus_update(void*) {
                         if (it2->second == it->first) it2 = g_serialToPromiseId.erase(it2); else ++it2;
                     }
                 }
-                it = g_promises.erase(it);
+                ++it;
             } else {
                 ++it;
             }
@@ -1101,6 +1139,50 @@ static void dbus_update(void*) {
     }
 }
 
+static void dbus_shutdown(DbusState* state) {
+    dbusState = state;
+    state->shuttingDown.store(true);
+    g_connecting.store(false);
+    if (g_connectThread.joinable()) g_connectThread.join();
+    g_running.store(false);
+    if (g_pumpThread.joinable()) g_pumpThread.join();
+    {
+        std::lock_guard<std::mutex> lk(g_connectWaitersMutex);
+        g_connectWaiterIds.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_cbMutex);
+        for (auto& cb : g_signalCallbacks) JS_FreeValue(g_ctx, cb);
+        g_signalCallbacks.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_promMutex);
+        for (auto& kv : g_promises) {
+            JS_FreeValue(g_ctx, kv.second.resolve);
+            JS_FreeValue(g_ctx, kv.second.reject);
+        }
+        g_promises.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_replyMutex);
+        while (!g_replies.empty()) g_replies.pop();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_sigMutex);
+        while (!g_signals.empty()) g_signals.pop();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_serialMapMutex);
+        g_serialToPromiseId.clear();
+    }
+    if (g_conn) {
+        dbus_connection_unref(g_conn);
+        g_conn = nullptr;
+    }
+    g_ctx = nullptr;
+    dbusState = nullptr;
+}
+
 // Module init — binds native functions as JS module exports.
 static int dbus_module_init(JSContext* ctx, JSModuleDef* m) {
     JS_SetModuleExport(ctx, m, "connect", JS_NewCFunction(ctx, js_connect, "connect", 1));
@@ -1113,75 +1195,34 @@ static int dbus_module_init(JSContext* ctx, JSModuleDef* m) {
 }
 
 extern "C" {
-// Required entry point
-JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*) {
+HELIX_PLUGIN_EXPORT int helix_plugin_integrate(JSContext* ctx, const char* module_name, const HelixPluginHost* host, HelixPluginInstance** out) {
+    if (!out) return 1;
+    auto* owner = new DbusPlugin();
+    if (!owner->initialize(host)) { delete owner; return 1; }
+    dbusState = &owner->runtime;
     g_ctx = ctx;
-    registerHook("script:update", dbus_update);
-    registerHook("script:cleanup", [](void*){
-        // Stop pump loop
-        g_running.store(false);
-        g_connecting.store(false);
-        // Join pump thread to avoid races with connection teardown
-        if (g_pumpThread.joinable()) {
-            g_pumpThread.join();
-        }
-        // Clear any queued connect waiters to avoid leaking promises on shutdown
-        {
-            std::vector<uint32_t> waiters;
-            {
-                std::lock_guard<std::mutex> lk(g_connectWaitersMutex);
-                waiters.swap(g_connectWaiterIds);
-            }
-            if (!waiters.empty()) {
-                std::lock_guard<std::mutex> lk(g_replyMutex);
-                for (uint32_t wid : waiters) {
-                    ReplyItem ri; ri.id = wid; ri.ok = false; ri.payload = std::string("canceled");
-                    g_replies.push(std::move(ri));
-                }
-            }
-        }
-        // Free signal callbacks
-        {
-            std::lock_guard<std::mutex> lk(g_cbMutex);
-            for (auto& cb : g_signalCallbacks) JS_FreeValue(g_ctx, cb);
-            g_signalCallbacks.clear();
-        }
-        // Free pending promises' JSValues
-        {
-            std::lock_guard<std::mutex> lk(g_promMutex);
-            for (auto& kv : g_promises) {
-                JS_FreeValue(g_ctx, kv.second.resolve);
-                JS_FreeValue(g_ctx, kv.second.reject);
-            }
-            g_promises.clear();
-        }
-        // Drop queued data
-        {
-            std::lock_guard<std::mutex> lk(g_replyMutex);
-            while (!g_replies.empty()) g_replies.pop();
-        }
-        {
-            std::lock_guard<std::mutex> lk(g_sigMutex);
-            while (!g_signals.empty()) g_signals.pop();
-        }
-        // Release shared DBus connection (do not close shared connections)
-        if (g_conn) {
-            dbus_connection_unref(g_conn);
-            g_conn = nullptr;
-        }
-    });
+    owner->instance.scriptUpdate = [](void* state, const HelixPluginUpdate*) {
+        dbusState = &static_cast<DbusPlugin*>(state)->runtime;
+        dbus_update(nullptr);
+    };
+    owner->instance.scriptShutdown = [](void* state){
+        dbus_shutdown(&static_cast<DbusPlugin*>(state)->runtime);
+    };
     JSModuleDef* m = JS_NewCModule(ctx, module_name, dbus_module_init);
-    if (!m) return nullptr;
+    if (!m) { dbus_shutdown(&owner->runtime); delete owner; return 1; }
     JS_AddModuleExport(ctx, m, "connect");
     JS_AddModuleExport(ctx, m, "addMatch");
     JS_AddModuleExport(ctx, m, "call");
     JS_AddModuleExport(ctx, m, "callComplex");
     JS_AddModuleExport(ctx, m, "onSignal");
     JS_AddModuleExport(ctx, m, "offSignal");
-    return m;
+    owner->instance.abiVersion = HELIX_PLUGIN_ABI_VERSION;
+    owner->instance.module = m;
+    owner->instance.state = owner;
+    owner->instance.destroy = [](void* state) { delete static_cast<DbusPlugin*>(state); };
+    *out = &owner->instance;
+    return 0;
 }
 }
 
 } // namespace
-
-

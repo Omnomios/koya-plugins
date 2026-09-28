@@ -24,12 +24,14 @@
    - All JS invocations happen on the engine thread for safety.
 */
 #include <atomic>
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <chrono>
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -46,7 +48,7 @@
 #include <unistd.h>
 
 #include "../../sdk/quickjs/quickjs.h"
-#include "../../sdk/module_hooks.h"
+#include "../../sdk/plugin_support.hpp"
 
 namespace {
 
@@ -62,27 +64,6 @@ struct EventItem {
     std::string payloadRaw;
 };
 
-// Thread-safe event queue
-static std::mutex g_queueMutex;
-static std::queue<EventItem> g_eventQueue;
-static size_t g_maxQueueSize = 2048; // bounded to avoid runaway
-
-// Subscriptions: event name -> vector of callbacks
-static std::mutex g_subMutex;
-static std::unordered_map<std::string, std::vector<JsCallback>> g_subscribers;
-
-// Global control
-static std::atomic<bool> g_running {false};
-static std::thread g_eventThread;
-
-// Sockets
-static std::string g_runtimeDir;
-static std::string g_instanceSig;
-static std::string g_sockCmdPath;
-static std::string g_sockEvtPath;
-
-static JSContext* g_ctx {nullptr};
-
 // Async command handling (send/json) resolved on update hook
 enum class JobType : uint8_t { Send, Json };
 struct PendingPromise {
@@ -96,11 +77,55 @@ struct JobResult {
     bool success;
     std::string payload; // raw output string
 };
-static std::atomic<uint32_t> g_nextJobId {1};
-static std::mutex g_promisesMutex;
-static std::unordered_map<uint32_t, PendingPromise> g_promises; // id -> pending
-static std::mutex g_resultsMutex;
-static std::queue<JobResult> g_results; // completed results from worker threads
+struct HyprState {
+    std::mutex queueMutex;
+    std::queue<EventItem> eventQueue;
+    std::mutex subscriptionMutex;
+    std::unordered_map<std::string, std::vector<JsCallback>> subscribers;
+    std::atomic<bool> running{false};
+    std::atomic<bool> stopping{false};
+    std::thread eventThread;
+    std::atomic<int> eventFd{-1};
+    std::mutex wakeMutex;
+    std::condition_variable wake;
+    std::string runtimeDir;
+    std::string instanceSignature;
+    std::string commandSocketPath;
+    std::string eventSocketPath;
+    JSContext* context{nullptr};
+    std::atomic<uint32_t> nextJobId{1};
+    std::mutex promisesMutex;
+    std::unordered_map<uint32_t, PendingPromise> promises;
+    std::mutex resultsMutex;
+    std::queue<JobResult> results;
+    std::vector<std::thread> jobThreads;
+    std::mutex activeSocketsMutex;
+    std::vector<int> activeSockets;
+};
+
+static constexpr size_t maxQueueSize = 2048;
+static thread_local HyprState* hyprState = nullptr;
+
+#define g_queueMutex (hyprState->queueMutex)
+#define g_eventQueue (hyprState->eventQueue)
+#define g_subMutex (hyprState->subscriptionMutex)
+#define g_subscribers (hyprState->subscribers)
+#define g_running (hyprState->running)
+#define g_eventThread (hyprState->eventThread)
+#define g_runtimeDir (hyprState->runtimeDir)
+#define g_instanceSig (hyprState->instanceSignature)
+#define g_sockCmdPath (hyprState->commandSocketPath)
+#define g_sockEvtPath (hyprState->eventSocketPath)
+#define g_ctx (hyprState->context)
+#define g_nextJobId (hyprState->nextJobId)
+#define g_promisesMutex (hyprState->promisesMutex)
+#define g_promises (hyprState->promises)
+#define g_resultsMutex (hyprState->resultsMutex)
+#define g_results (hyprState->results)
+
+struct HyprPlugin : HelixPluginSupport {
+    HyprState runtime;
+};
 
 // Forward declaration for helper used by background workers
 static int connect_unix(const std::string& path);
@@ -117,26 +142,42 @@ static JSValue enqueue_job_promise(JSContext* ctx, JobType type, std::string cmd
         g_promises.emplace(id, PendingPromise{ctx, resolve, reject, type});
     }
 
-    std::thread([id, cmd = std::move(cmd)]() mutable {
+    HyprState* state = hyprState;
+    state->jobThreads.emplace_back([state, id, cmd = std::move(cmd)]() mutable {
+        hyprState = state;
         int fd = connect_unix(g_sockCmdPath);
         bool ok = false;
         std::string out;
         if (fd >= 0) {
-            std::string line = cmd;
-            line.push_back('\0');
-            ::send(fd, line.data(), line.size(), 0);
-            char buf[65536];
-            ssize_t rn = ::recv(fd, buf, sizeof(buf) - 1, 0);
-            if (rn > 0) {
-                buf[rn] = '\0';
-                out.assign(buf);
-                ok = true;
+            {
+                std::lock_guard<std::mutex> lk(state->activeSocketsMutex);
+                if (!state->stopping.load()) state->activeSockets.push_back(fd);
+            }
+            if (!state->stopping.load()) {
+                std::string line = cmd;
+                line.push_back('\0');
+                ::send(fd, line.data(), line.size(), 0);
+                char buf[65536];
+                ssize_t rn = ::recv(fd, buf, sizeof(buf) - 1, 0);
+                if (rn > 0) {
+                    buf[rn] = '\0';
+                    out.assign(buf);
+                    ok = true;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lk(state->activeSocketsMutex);
+                auto it = std::find(state->activeSockets.begin(), state->activeSockets.end(), fd);
+                if (it != state->activeSockets.end()) state->activeSockets.erase(it);
             }
             ::close(fd);
         }
-        std::lock_guard<std::mutex> lk(g_resultsMutex);
-        g_results.push(JobResult{id, ok, std::move(out)});
-    }).detach();
+        if (!state->stopping.load()) {
+            std::lock_guard<std::mutex> lk(g_resultsMutex);
+            g_results.push(JobResult{id, ok, std::move(out)});
+        }
+        hyprState = nullptr;
+    });
 
     return promise;
 }
@@ -197,17 +238,22 @@ static std::optional<std::string> read_line(int fd) {
 }
 
 // Background loop: (re)connects to the event socket and enqueues events.
-static void event_loop() {
+static void event_loop(HyprState* state) {
+    hyprState = state;
     const int backoffStartMs = 200;
     const int backoffMaxMs = 5000;
     int backoffMs = backoffStartMs;
     while (g_running.load()) {
         int fd = connect_unix(g_sockEvtPath);
         if (fd < 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
+            std::unique_lock<std::mutex> lock(state->wakeMutex);
+            state->wake.wait_for(lock, std::chrono::milliseconds(backoffMs), [state] {
+                return !state->running.load();
+            });
             backoffMs = std::min(backoffMaxMs, backoffMs * 2);
             continue;
         }
+        state->eventFd.store(fd);
         backoffMs = backoffStartMs;
 
         // Read lines as events
@@ -222,14 +268,16 @@ static void event_loop() {
             std::string payload = sep == std::string::npos ? std::string() : line.substr(sep + 2);
 
             std::lock_guard<std::mutex> lk(g_queueMutex);
-            if (g_eventQueue.size() >= g_maxQueueSize) {
+            if (g_eventQueue.size() >= maxQueueSize) {
                 // drop oldest
                 g_eventQueue.pop();
             }
             g_eventQueue.push(EventItem{std::move(name), std::move(payload)});
         }
+        state->eventFd.store(-1);
         ::close(fd);
     }
+    hyprState = nullptr;
 }
 
 static JSValue throw_type(JSContext* ctx, const char* msg) {
@@ -269,9 +317,8 @@ static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSVal
     g_sockEvtPath = build_sock_path(g_runtimeDir, g_instanceSig, true);
 
     if (!g_running.exchange(true)) {
-        g_eventThread = std::thread(event_loop);
-        // Detach to avoid std::terminate at process shutdown if not joined
-        g_eventThread.detach();
+        HyprState* state = hyprState;
+        g_eventThread = std::thread([state] { event_loop(state); });
     }
     return JS_UNDEFINED;
 }
@@ -470,6 +517,49 @@ static void hypr_update_callback(void* /*data*/) {
     }
 }
 
+static void hypr_shutdown(HyprState* state) {
+    hyprState = state;
+    state->stopping.store(true);
+    g_running.store(false);
+    state->wake.notify_all();
+    const int eventFd = state->eventFd.load();
+    if (eventFd >= 0) ::shutdown(eventFd, SHUT_RDWR);
+    {
+        std::lock_guard<std::mutex> lk(state->activeSocketsMutex);
+        for (int fd : state->activeSockets) ::shutdown(fd, SHUT_RDWR);
+    }
+    if (g_eventThread.joinable()) g_eventThread.join();
+    for (auto& worker : state->jobThreads) {
+        if (worker.joinable()) worker.join();
+    }
+    state->jobThreads.clear();
+    {
+        std::lock_guard<std::mutex> lk(g_queueMutex);
+        while (!g_eventQueue.empty()) g_eventQueue.pop();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_subMutex);
+        for (auto &kv : g_subscribers) {
+            for (auto &cb : kv.second) JS_FreeValue(g_ctx, cb.func);
+        }
+        g_subscribers.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_promisesMutex);
+        for (auto &kv : g_promises) {
+            JS_FreeValue(g_ctx, kv.second.resolve);
+            JS_FreeValue(g_ctx, kv.second.reject);
+        }
+        g_promises.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_resultsMutex);
+        while (!g_results.empty()) g_results.pop();
+    }
+    g_ctx = nullptr;
+    hyprState = nullptr;
+}
+
 static int hypr_module_init(JSContext* ctx, JSModuleDef* m) {
     JS_SetModuleExport(ctx, m, "connect", JS_NewCFunction(ctx, js_connect, "connect", 1));
     JS_SetModuleExport(ctx, m, "on", JS_NewCFunction(ctx, js_on, "on", 2));
@@ -488,50 +578,21 @@ static int hypr_module_init(JSContext* ctx, JSModuleDef* m) {
 }
 
 extern "C" {
-// Required entry point
-JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*) {
+HELIX_PLUGIN_EXPORT int helix_plugin_integrate(JSContext* ctx, const char* module_name, const HelixPluginHost* host, HelixPluginInstance** out) {
+    if(!out) return 1;
+    auto* owner = new HyprPlugin();
+    if(!owner->initialize(host)) { delete owner; return 1; }
+    hyprState = &owner->runtime;
     g_ctx = ctx;
-    registerHook("script:update", hypr_update_callback);
-    // Ensure we release all JS references and stop background work on engine shutdown
-    registerHook("script:cleanup", [](void* /*data*/){
-        // Signal background thread to stop
-        g_running.store(false);
-        // Best-effort: drop any queued events
-        {
-            std::lock_guard<std::mutex> lk(g_queueMutex);
-            while (!g_eventQueue.empty()) g_eventQueue.pop();
-        }
-        // Free all subscriber callbacks
-        {
-            std::lock_guard<std::mutex> lk(g_subMutex);
-            for (auto &kv : g_subscribers) {
-                for (auto &cb : kv.second) {
-                    if (JS_IsFunction(g_ctx, cb.func)) {
-                        JS_FreeValue(g_ctx, cb.func);
-                    }
-                }
-            }
-            g_subscribers.clear();
-        }
-        // Free any pending promise resolve/reject functions
-        {
-            std::lock_guard<std::mutex> lk(g_promisesMutex);
-            for (auto &kv : g_promises) {
-                JS_FreeValue(g_ctx, kv.second.resolve);
-                JS_FreeValue(g_ctx, kv.second.reject);
-            }
-            g_promises.clear();
-        }
-        // Drop completed results queue
-        {
-            std::lock_guard<std::mutex> lk(g_resultsMutex);
-            while (!g_results.empty()) g_results.pop();
-        }
-        // Clear context pointer last
-        g_ctx = nullptr;
-    });
+    owner->instance.scriptUpdate = [](void* state, const HelixPluginUpdate*) {
+        hyprState = &static_cast<HyprPlugin*>(state)->runtime;
+        hypr_update_callback(nullptr);
+    };
+    owner->instance.scriptShutdown = [](void* state){
+        hypr_shutdown(&static_cast<HyprPlugin*>(state)->runtime);
+    };
     JSModuleDef* m = JS_NewCModule(ctx, module_name, hypr_module_init);
-    if (!m) return nullptr;
+    if (!m) { hypr_shutdown(&owner->runtime); delete owner; return 1; }
     JS_AddModuleExport(ctx, m, "connect");
     JS_AddModuleExport(ctx, m, "on");
     JS_AddModuleExport(ctx, m, "off");
@@ -544,10 +605,13 @@ JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFu
     JS_AddModuleExport(ctx, m, "activewindow");
     JS_AddModuleExport(ctx, m, "version");
     JS_AddModuleExport(ctx, m, "getOption");
-    return m;
+    owner->instance.abiVersion = HELIX_PLUGIN_ABI_VERSION;
+    owner->instance.module = m;
+    owner->instance.state = owner;
+    owner->instance.destroy = [](void* state) { delete static_cast<HyprPlugin*>(state); };
+    *out = &owner->instance;
+    return 0;
 }
 }
 
 } // namespace
-
-

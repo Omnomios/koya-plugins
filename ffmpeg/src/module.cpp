@@ -23,7 +23,7 @@
 #include <unordered_map>
 
 #include "../../sdk/quickjs/quickjs.h"
-#include "../../sdk/module_hooks.h"
+#include "../../sdk/plugin_support.hpp"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -33,6 +33,7 @@ extern "C" {
 }
 
 struct VideoStream {
+    const PluginServices* services = nullptr;
     unsigned int windowId = 0;
     std::string key;
     int width = 0;
@@ -74,10 +75,20 @@ struct VideoStream {
     double pausedAccumSec = 0.0;
 };
 
-static JSContext* g_ctx = nullptr;
-static const KoyaRendererV1* g_renderer = nullptr;
-static std::mutex g_mutex;
-static std::map<std::string, std::unique_ptr<VideoStream>> g_streams; // key -> stream
+struct FfmpegState
+{
+    JSContext* context = nullptr;
+    const PluginServices* renderer = nullptr;
+    std::mutex mutex;
+    std::map<std::string, std::unique_ptr<VideoStream>> streams;
+};
+
+struct FfmpegPlugin : HelixPluginSupport { FfmpegState state; };
+static thread_local FfmpegState* ffmpegState = nullptr;
+#define g_ctx (ffmpegState->context)
+#define g_renderer (ffmpegState->renderer)
+#define g_mutex (ffmpegState->mutex)
+#define g_streams (ffmpegState->streams)
 
 // Build a unique id per window+key to avoid collisions across windows
 static inline std::string make_stream_id(uint32_t windowId, const std::string& key)
@@ -119,9 +130,9 @@ static void teardown_stream(VideoStream* s)
             std::free(s->avioOpaque);
             s->avioOpaque = nullptr;
         }
-        if(s->assetBuf && g_renderer && g_renderer->asset_free_buffer)
+        if(s->assetBuf && s->services && s->services->asset_free_buffer)
         {
-            g_renderer->asset_free_buffer((void*)g_renderer->ctx, s->assetBuf);
+            s->services->asset_free_buffer((void*)s->services->ctx, s->assetBuf);
             s->assetBuf = nullptr;
             s->assetSize = 0;
         }
@@ -149,6 +160,7 @@ static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
 
     // Allocate and open
     auto vs = std::make_unique<VideoStream>();
+    vs->services = g_renderer;
     vs->windowId = windowId;
     vs->key = k;
     JS_FreeCString(ctx, k);
@@ -246,7 +258,8 @@ static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
     vs->frameDurationSec = 1.0 / vs->avgFps;
 
     // Create texture
-    int ok = g_renderer->create_texture_rgba((void*)g_renderer->ctx, windowId, vs->key.c_str(), vs->width, vs->height, 0);
+    int ok = g_renderer->create_texture_rgba((void*)g_renderer->ctx, windowId, vs->key.c_str(), vs->width, vs->height, 0,
+                                             HELIX_RENDER_TEXTURE_COLOR_SRGB_PREMUL);
     if(!ok) return JS_ThrowInternalError(ctx, "create_texture_rgba failed");
 
     vs->running.store(true);
@@ -337,9 +350,9 @@ static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
                             }
                             s->latestVersion.fetch_add(1, std::memory_order_release);
                         }
-                        if(g_renderer && g_renderer->request_window_render)
+                        if(s->services && s->services->request_window_render)
                         {
-                            int ok = g_renderer->request_window_render((void*)g_renderer->ctx, s->windowId);
+                            int ok = s->services->request_window_render((void*)s->services->ctx, s->windowId);
                             if(!ok)
                             {
                                 // Window likely destroyed; stop decoding this stream
@@ -456,7 +469,7 @@ static int ffmpeg_module_init(JSContext* ctx, JSModuleDef* m)
 // render_begin hook: update active streams
 static void on_render_begin(void* data)
 {
-    const KoyaRenderBeginDataV1* rb = reinterpret_cast<const KoyaRenderBeginDataV1*>(data);
+    const HelixPluginRenderBegin* rb = reinterpret_cast<const HelixPluginRenderBegin*>(data);
     if(!rb || !g_renderer) return;
     // Collect keys for this window
     std::vector<std::string> keys;
@@ -481,7 +494,8 @@ static void on_render_begin(void* data)
         std::lock_guard<std::mutex> lk2(s->qmutex);
         const std::uint64_t v = s->latestVersion.load(std::memory_order_acquire);
         if(v == s->lastConsumedVersion || s->latestRgba.empty()) continue;
-        g_renderer->update_texture_rgba((void*)g_renderer->ctx, s->windowId, s->key.c_str(), s->latestRgba.data(), s->width*4, s->width, s->height, 0);
+        g_renderer->update_texture_rgba((void*)g_renderer->ctx, s->windowId, s->key.c_str(), s->latestRgba.data(), s->width*4, s->width, s->height, 0,
+                                        HELIX_RENDER_TEXTURE_COLOR_SRGB_PREMUL);
         s->lastConsumedVersion = v;
     }
 }
@@ -490,19 +504,34 @@ static void on_render_begin(void* data)
 static void ffmpeg_cleanup(void* /*data*/);
 
 extern "C" {
-JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1* renderer)
+HELIX_PLUGIN_EXPORT int helix_plugin_integrate(JSContext* ctx, const char* module_name, const HelixPluginHost* host, HelixPluginInstance** out)
 {
-    g_ctx = ctx; g_renderer = renderer;
-    registerHook("render_begin", on_render_begin);
-    registerHook("cleanup", ffmpeg_cleanup);
+    if(!out) return 1;
+    auto* owner = new FfmpegPlugin();
+    if(!owner->initialize(host)) { delete owner; return 1; }
+    ffmpegState = &owner->state;
+    g_ctx = ctx; g_renderer = &owner->services;
     JSModuleDef* m = JS_NewCModule(ctx, module_name, ffmpeg_module_init);
-    if(!m) return nullptr;
+    if(!m) { ffmpegState = nullptr; delete owner; return 1; }
     JS_AddModuleExport(ctx, m, "load");
     JS_AddModuleExport(ctx, m, "stop");
     JS_AddModuleExport(ctx, m, "play");
     JS_AddModuleExport(ctx, m, "pause");
     JS_AddModuleExport(ctx, m, "details");
-    return m;
+    owner->instance.abiVersion = HELIX_PLUGIN_ABI_VERSION;
+    owner->instance.module = m;
+    owner->instance.state = owner;
+    owner->instance.renderBegin = [](void* opaque, const HelixPluginRenderBegin* render) {
+        ffmpegState = &static_cast<FfmpegPlugin*>(opaque)->state;
+        on_render_begin(const_cast<HelixPluginRenderBegin*>(render));
+    };
+    owner->instance.engineShutdown = [](void* opaque) {
+        ffmpegState = &static_cast<FfmpegPlugin*>(opaque)->state;
+        ffmpeg_cleanup(nullptr);
+    };
+    owner->instance.destroy = [](void* state) { delete static_cast<FfmpegPlugin*>(state); };
+    *out = &owner->instance;
+    return 0;
 }
 }
 

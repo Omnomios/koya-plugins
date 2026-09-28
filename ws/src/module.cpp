@@ -39,7 +39,7 @@
 #include "../../sdk/quickjs/quickjs.h"
 
 // Include the hook system interface
-#include "../../sdk/module_hooks.h"
+#include "../../sdk/plugin_support.hpp"
 
 // WebSocket state
 // JS callbacks tied to a WebSocket instance.
@@ -60,6 +60,8 @@ struct JsWebSocketMessage {
     bool binary;       // Only relevant for Message
 };
 
+using WsMessageBatch = std::unordered_map<uint32_t, std::vector<std::unique_ptr<JsWebSocketMessage>>>;
+
 // A single WebSocket: native socket, message queue, and callbacks.
 struct WsInstance
 {
@@ -68,10 +70,36 @@ struct WsInstance
     WsCallbacks callbacks;
 };
 
-static std::mutex ws_mutex;
-static std::unordered_map<uint32_t, std::unique_ptr<WsInstance>> ws_instances;
-static std::atomic<uint32_t> ws_next_id{1};
-static bool ws_net_initialized = false;
+struct WebSocketState
+{
+    std::mutex mutex;
+    std::unordered_map<uint32_t, std::unique_ptr<WsInstance>> instances;
+    std::atomic<uint32_t> nextId{1};
+    bool networkInitialized = false;
+    JSContext* context = nullptr;
+};
+
+struct WebSocketPlugin : HelixPluginSupport { WebSocketState state; };
+static std::mutex wsNetMutex;
+static size_t wsNetUsers = 0;
+static thread_local WebSocketState* webSocketState = nullptr;
+#define ws_mutex (webSocketState->mutex)
+#define ws_instances (webSocketState->instances)
+#define ws_next_id (webSocketState->nextId)
+#define ws_net_initialized (webSocketState->networkInitialized)
+#define g_ws_ctx (webSocketState->context)
+
+static void retain_net_system()
+{
+    std::lock_guard<std::mutex> lock(wsNetMutex);
+    if(wsNetUsers++ == 0) ix::initNetSystem();
+}
+
+static void release_net_system()
+{
+    std::lock_guard<std::mutex> lock(wsNetMutex);
+    if(wsNetUsers != 0 && --wsNetUsers == 0) ix::uninitNetSystem();
+}
 
 static std::string jsvalue_to_string ( JSContext* ctx, JSValueConst val )
 {
@@ -183,7 +211,7 @@ static JSValue ws_create ( JSContext* ctx, JSValueConst this_val, int argc, JSVa
 
     if(!ws_net_initialized)
     {
-        ix::initNetSystem();
+        retain_net_system();
         ws_net_initialized = true;
     }
     uint32_t id = ws_next_id++;
@@ -202,9 +230,10 @@ static JSValue ws_create ( JSContext* ctx, JSValueConst this_val, int argc, JSVa
     ws->socket->setUrl(url);
 
     // Message callback
-    ws->socket->setOnMessageCallback([id](const ix::WebSocketMessagePtr& msg) {
-        std::lock_guard<std::mutex> lock(ws_mutex);
-        if(ws_instances.count(id))
+    auto* callbackState = webSocketState;
+    ws->socket->setOnMessageCallback([callbackState, id](const ix::WebSocketMessagePtr& msg) {
+        std::lock_guard<std::mutex> lock(callbackState->mutex);
+        if(callbackState->instances.count(id))
         {
             auto jsmsg = std::make_unique<JsWebSocketMessage>();
             jsmsg->type = msg->type;
@@ -213,7 +242,7 @@ static JSValue ws_create ( JSContext* ctx, JSValueConst this_val, int argc, JSVa
             if (msg->type == ix::WebSocketMessageType::Error) {
                 jsmsg->str = msg->errorInfo.reason;
             }
-            ws_instances[id]->messageQueue.push(std::move(jsmsg));
+            callbackState->instances[id]->messageQueue.push(std::move(jsmsg));
         }
     });
     {
@@ -236,7 +265,7 @@ static JSValue ws_create ( JSContext* ctx, JSValueConst this_val, int argc, JSVa
 // JS: drain() — deliver queued messages to JS; also wired to `update`.
 static JSValue ws_drain ( JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv )
 {
-    std::unordered_map<uint32_t, std::vector<std::unique_ptr<JsWebSocketMessage>>> local_queues;
+    WsMessageBatch local_queues;
     {
         std::lock_guard<std::mutex> lock(ws_mutex);
         for(auto& [id, ws] : ws_instances)
@@ -248,55 +277,56 @@ static JSValue ws_drain ( JSContext* ctx, JSValueConst this_val, int argc, JSVal
             }
         }
     }
-    // Now process local_queues outside the lock
+    // Resolve the callback for each message under the state lock, then invoke a
+    // duplicate outside the lock so callbacks may destroy their own socket.
     for(auto& [id, messages] : local_queues)
     {
-        auto it = ws_instances.find(id);
-        if(it == ws_instances.end()) continue;
-        auto& ws = it->second;
         for(auto& msg : messages)
         {
+            JSValue callback = JS_NULL;
+            {
+                std::lock_guard<std::mutex> lock(ws_mutex);
+                auto it = ws_instances.find(id);
+                if(it == ws_instances.end()) continue;
+                JSValue source = JS_NULL;
+                switch(msg->type) {
+                    case ix::WebSocketMessageType::Message: source = it->second->callbacks.onMessage; break;
+                    case ix::WebSocketMessageType::Open: source = it->second->callbacks.onOpen; break;
+                    case ix::WebSocketMessageType::Close: source = it->second->callbacks.onClose; break;
+                    case ix::WebSocketMessageType::Error: source = it->second->callbacks.onError; break;
+                    default: break;
+                }
+                if(JS_IsFunction(ctx, source)) callback = JS_DupValue(ctx, source);
+            }
+            if(JS_IsNull(callback)) continue;
+            JSValue result = JS_UNDEFINED;
             switch (msg->type)
             {
                 case ix::WebSocketMessageType::Message:
-                    if(!JS_IsNull(ws->callbacks.onMessage))
-                    {
-                        JSValue arg;
-                        if(msg->binary)
-                        {
-                            arg = JS_NewArrayBufferCopy(ctx, (const uint8_t*)msg->str.data(), msg->str.size());
-                        }
-                        else
-                        {
-                            arg = JS_NewString(ctx, msg->str.c_str());
-                        }
-                        JS_Call(ctx, ws->callbacks.onMessage, JS_UNDEFINED, 1, &arg);
-                        JS_FreeValue(ctx, arg);
-                    }
+                {
+                    JSValue arg = msg->binary
+                        ? JS_NewArrayBufferCopy(ctx, (const uint8_t*)msg->str.data(), msg->str.size())
+                        : JS_NewString(ctx, msg->str.c_str());
+                    result = JS_Call(ctx, callback, JS_UNDEFINED, 1, &arg);
+                    JS_FreeValue(ctx, arg);
                     break;
+                }
                 case ix::WebSocketMessageType::Open:
-                    if(!JS_IsNull(ws->callbacks.onOpen))
-                    {
-                        JS_Call(ctx, ws->callbacks.onOpen, JS_UNDEFINED, 0, nullptr);
-                    }
-                    break;
                 case ix::WebSocketMessageType::Close:
-                    if(!JS_IsNull(ws->callbacks.onClose))
-                    {
-                        JS_Call(ctx, ws->callbacks.onClose, JS_UNDEFINED, 0, nullptr);
-                    }
+                    result = JS_Call(ctx, callback, JS_UNDEFINED, 0, nullptr);
                     break;
                 case ix::WebSocketMessageType::Error:
-                    if(!JS_IsNull(ws->callbacks.onError))
-                    {
-                        JSValue arg = JS_NewString(ctx, msg->str.c_str());
-                        JS_Call(ctx, ws->callbacks.onError, JS_UNDEFINED, 1, &arg);
-                        JS_FreeValue(ctx, arg);
-                    }
+                {
+                    JSValue arg = JS_NewString(ctx, msg->str.c_str());
+                    result = JS_Call(ctx, callback, JS_UNDEFINED, 1, &arg);
+                    JS_FreeValue(ctx, arg);
                     break;
+                }
                 default:
                     break;
             }
+            JS_FreeValue(ctx, result);
+            JS_FreeValue(ctx, callback);
         }
     }
     return JS_UNDEFINED;
@@ -310,95 +340,57 @@ static int ws_module_init ( JSContext* ctx, JSModuleDef* m )
 }
 
 // Global context for the WebSocket module
-static JSContext* g_ws_ctx = nullptr;
-
 // Update hook callback for the WebSocket module (handles drain)
 // Hook: update — same behavior as ws_drain(), invoked automatically each tick.
 void ws_update_callback(void* data)
 {
     if (g_ws_ctx)
     {
-        // Process the message queues (same logic as ws_drain)
-        std::unordered_map<uint32_t, std::vector<std::unique_ptr<JsWebSocketMessage>>> local_queues;
-        {
-            std::lock_guard<std::mutex> lock(ws_mutex);
-            for(auto& [id, ws] : ws_instances)
-            {
-                while(!ws->messageQueue.empty())
-                {
-                    local_queues[id].push_back(std::move(ws->messageQueue.front()));
-                    ws->messageQueue.pop();
-                }
-            }
-        }
-        // Process the messages
-        for(auto& [id, messages] : local_queues)
-        {
-            auto it = ws_instances.find(id);
-            if(it == ws_instances.end()) continue;
-            auto& ws = it->second;
-            for(auto& msg : messages)
-            {
-                switch (msg->type)
-                {
-                    case ix::WebSocketMessageType::Message:
-                        if(!JS_IsNull(ws->callbacks.onMessage))
-                        {
-                            JSValue arg;
-                            if(msg->binary)
-                            {
-                                arg = JS_NewArrayBufferCopy(g_ws_ctx, (const uint8_t*)msg->str.data(), msg->str.size());
-                            }
-                            else
-                            {
-                                arg = JS_NewString(g_ws_ctx, msg->str.c_str());
-                            }
-                            JS_Call(g_ws_ctx, ws->callbacks.onMessage, JS_UNDEFINED, 1, &arg);
-                            JS_FreeValue(g_ws_ctx, arg);
-                        }
-                        break;
-                    case ix::WebSocketMessageType::Open:
-                        if(!JS_IsNull(ws->callbacks.onOpen))
-                        {
-                            JS_Call(g_ws_ctx, ws->callbacks.onOpen, JS_UNDEFINED, 0, nullptr);
-                        }
-                        break;
-                    case ix::WebSocketMessageType::Close:
-                        if(!JS_IsNull(ws->callbacks.onClose))
-                        {
-                            JS_Call(g_ws_ctx, ws->callbacks.onClose, JS_UNDEFINED, 0, nullptr);
-                        }
-                        break;
-                    case ix::WebSocketMessageType::Error:
-                        if(!JS_IsNull(ws->callbacks.onError))
-                        {
-                            JSValue arg = JS_NewString(g_ws_ctx, msg->str.c_str());
-                            JS_Call(g_ws_ctx, ws->callbacks.onError, JS_UNDEFINED, 1, &arg);
-                            JS_FreeValue(g_ws_ctx, arg);
-                        }
-                        break;
-                    default:
-                        break;
-                }
-            }
-        }
+        ws_drain(g_ws_ctx, JS_UNDEFINED, 0, nullptr);
     }
 }
 
 extern "C" {
-// Required entry point with renderer services (unused by this plugin but part of ABI)
-JSModuleDef* integrateV1 ( JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1* )
+HELIX_PLUGIN_EXPORT int helix_plugin_integrate (JSContext* ctx, const char* module_name, const HelixPluginHost* host, HelixPluginInstance** out)
 {
+    if(!out) return 1;
+    auto* owner = new WebSocketPlugin();
+    if(!owner->initialize(host)) { delete owner; return 1; }
+    webSocketState = &owner->state;
     // Store the context for use in update callback
     g_ws_ctx = ctx;
 
-    // Register our script-update hook callback
-    registerHook("script:update", ws_update_callback);
-
     JSModuleDef* m = JS_NewCModule(ctx, module_name, ws_module_init);
-    if(!m) return nullptr;
+    if(!m) { webSocketState = nullptr; delete owner; return 1; }
     JS_AddModuleExport(ctx, m, "create");
     JS_AddModuleExport(ctx, m, "drain");
-    return m;
+    owner->instance.abiVersion = HELIX_PLUGIN_ABI_VERSION;
+    owner->instance.module = m;
+    owner->instance.state = owner;
+    owner->instance.scriptUpdate = [](void* opaque, const HelixPluginUpdate*) {
+        webSocketState = &static_cast<WebSocketPlugin*>(opaque)->state;
+        ws_update_callback(nullptr);
+    };
+    owner->instance.scriptShutdown = [](void* opaque) {
+        webSocketState = &static_cast<WebSocketPlugin*>(opaque)->state;
+        std::unordered_map<uint32_t, std::unique_ptr<WsInstance>> local;
+        {
+            std::lock_guard<std::mutex> lock(ws_mutex);
+            local.swap(ws_instances);
+        }
+        for(auto& pair : local)
+        {
+            if(pair.second->socket) pair.second->socket->stop();
+            ws_free_callbacks(pair.second->callbacks);
+        }
+        if(ws_net_initialized) {
+            release_net_system();
+            ws_net_initialized = false;
+        }
+        g_ws_ctx = nullptr;
+    };
+    owner->instance.destroy = [](void* state) { delete static_cast<WebSocketPlugin*>(state); };
+    *out = &owner->instance;
+    return 0;
 }
 }

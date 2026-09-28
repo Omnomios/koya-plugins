@@ -21,6 +21,7 @@
 
 #include <thread>
 #include <semaphore>
+#include <memory>
 #include "httplib.h"
 #include "../../sdk/threaded/Queue.hpp"
 
@@ -36,6 +37,14 @@ public:
         Delete
     };
 
+    struct MultipartPart
+    {
+        std::string name;
+        std::string filename;
+        std::string contentType;
+        std::string body;
+    };
+
     struct Job
     {
         Method method = Method::Get;
@@ -48,6 +57,8 @@ public:
 
         httplib::Headers headers;
         std::string body;
+        std::string multipartBoundary;
+        std::shared_ptr<std::vector<MultipartPart>> multipart;
         std::vector<uint8_t> bodyBinary;
         int status = 0;
     };
@@ -56,7 +67,9 @@ public:
     Http ();
     ~Http ();
 
-    void request (const Method& method, const std::string& url, std::function<void(Job)> callback, const httplib::Headers& headers = {}, const std::string& body = "", bool binary = false)
+    void request (const Method& method, const std::string& url, std::function<void(Job)> callback,
+                  const httplib::Headers& headers = {}, const std::string& body = "", bool binary = false,
+                  const std::string& multipartBoundary = "", std::vector<MultipartPart> multipart = {})
     {
         Job job;
         job.method = method;
@@ -65,6 +78,8 @@ public:
         job.headers = headers;
         job.body = body;
         job.binary = binary;
+        job.multipartBoundary = multipartBoundary;
+        if(!multipart.empty()) job.multipart = std::make_shared<std::vector<MultipartPart>>(std::move(multipart));
         this->waiting.push(job);
         this->jobSignal.release();
     }

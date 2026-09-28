@@ -1,120 +1,133 @@
-## Koya Plugins — Build native power into your UI
+# Native plugin SDK for Koya and Syncromesh
 
-This repository showcases native plugins that extend the Koya runtime with system capabilities like DBus, HTTP(S), Hyprland IPC, processes, SQLite, and WebSockets. Each plugin is intentionally small and commented to help you author your own.
+SDK headers and C++ examples for adding native JavaScript modules to Koya and
+Syncromesh. The included plugins cover networking, databases, media, and system
+services, and can be used directly or as starting points for your own modules.
 
-### Architecture in one minute
+Follow the implementations to learn module exports, asynchronous work,
+script-thread callbacks, and resource cleanup.
 
-- Engine (Koya): JavaScript runtime (QuickJS), module system, and lifecycle hooks so work can be executed on the engine thread.
-- Plugin (your code): Performs OS/network I/O and threading, then delivers results back to JS during engine hooks.
+## Included plugins
 
-Typical shape of a plugin: export `integrateV1(JSContext*, const char*, RegisterHookFunc, const KoyaRendererV1*)` which:
+| Plugin | What it provides | Development dependencies |
+| --- | --- | --- |
+| `dbus` | DBus connections, method calls, and signals | `dbus-1` |
+| `ffmpeg` | Video decoding and frame delivery to engine textures | `libavformat`, `libavcodec`, `libavutil`, `libswscale` |
+| `http` | Asynchronous HTTP(S) requests and binary responses | OpenSSL for HTTPS on Unix; WinHTTP and Winsock on Windows |
+| `hypr` | Hyprland IPC events, commands, and queries | Unix sockets; Unix only |
+| `pam` | Authentication through PAM | PAM; Unix only |
+| `process` | Child processes, streamed output, and environment access | POSIX process APIs; Unix only |
+| `sqlite` | SQLite databases with asynchronous SQL execution and queries | `sqlite3` |
+| `ws` | WebSocket connections and message callbacks | OpenSSL on Unix; Winsock and Shlwapi on Windows |
 
-- Registers hooks using the provided `RegisterHookFunc`.
-- Creates a JS module via `JS_NewCModule` and exports your API functions.
-- Keeps blocking or async work off the engine thread; drains results on the appropriate hook thread.
+## Build
 
-### Migration notice (thread split)
+Install Meson, Ninja, a C++20 compiler, and the development dependencies for
+the plugins you want to build. The plugin interface and QuickJS headers
+are included under `sdk/`.
 
-Koya's scripting runtime now runs on a dedicated script thread. Plugin hooks are now split by name:
+Build a subset:
 
-- `update`, `cleanup`, `render_begin`, etc. run on the engine thread.
-- `script:update` and `script:cleanup` run on the script thread and are intended for QuickJS API use (Promise settle, callback invocation, JSValue cleanup).
-
-If your plugin calls QuickJS APIs (`JS_Call`, `JS_FreeValue`, `JS_Throw*`, etc.) from hook callbacks, migrate those callbacks to `script:update` / `script:cleanup`.
-
-### Quick usage examples
-
-DBus (minimal):
-```js
-import * as dbus from 'Module/dbus';
-await dbus.connect('session');
-dbus.addMatch("type='signal',interface='org.freedesktop.DBus'");
-dbus.onSignal(s => console.log('signal', s));
-const reply = await dbus.call('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'ListNames');
+```sh
+meson setup build --buildtype=release -Dplugins=http,sqlite
+meson compile -C build
 ```
 
-HTTP:
+Or build all eight plugins, which is also the default selection:
+
+```sh
+meson setup build --buildtype=release -Dplugins=all
+meson compile -C build
+```
+
+Shared libraries are produced directly in `build/`, for example
+`build/libhx-http.so` on Linux or `build/libhx-http.dll` on Windows. Add that
+directory to the engine's native module search path, or place the libraries
+beside the engine executable. Koya accepts `-n <directory>` for native modules.
+
+HTTP enables OpenSSL when `-Dhttp_tls=enabled`, or when the default `auto`
+detection finds it. Use `-Dhttp_tls=disabled` for an HTTP-only Unix build.
+Windows uses WinHTTP for HTTPS.
+
+On Unix, plugins resolve QuickJS symbols from the engine by default. Its
+QuickJS version and configuration must match the bundled headers. If you need
+to link a matching QuickJS library explicitly, pass
+`-Dquickjs_library=/absolute/path/to/libquickjs.a`. Windows requires a matching
+QuickJS library supported by the selected compiler and an explicit selection
+of supported plugins, such as `-Dplugins=http,sqlite,ws`.
+
+## Use from JavaScript
+
+Import native plugins with `Module/<name>` in either engine:
+
 ```js
 import * as http from 'Module/http';
-const res = await http.request({ url: 'https://example.com', method: 'get' });
-console.log(res.status, res.body);
+
+const response = await http.request({
+  url: 'https://example.com',
+  method: 'get',
+});
+console.log(response.status, response.body);
 ```
 
-Hyprland IPC:
+For a local database:
+
 ```js
-import * as hypr from 'Module/hypr';
-await hypr.connect({});
-hypr.on('workspace', e => console.log('workspace event', e));
-const ws = await hypr.workspaces();
+import * as sqlite from 'Module/sqlite';
+
+const db = sqlite.openInMemory();
+try {
+  await sqlite.exec(db, 'CREATE TABLE messages (text TEXT)');
+  await sqlite.exec(db, "INSERT INTO messages VALUES ('Hello from a native plugin')");
+  const rows = await sqlite.query(db, 'SELECT text FROM messages');
+  console.log(rows);
+} finally {
+  sqlite.close(db);
+}
 ```
 
-Process:
-```js
-import * as proc from 'Module/process';
-const p = proc.spawn({ cmd: 'bash', args: ['-lc', 'echo hi && sleep 1 && echo bye'] });
-p.stdout.on('data', chunk => print('out', chunk));
-p.on('exit', code => print('exit', code));
-const path = proc.getEnv('PATH', '/usr/bin');
-const allEnv = proc.env();
-```
+The engine drives asynchronous completions and callbacks on its script thread.
 
-SQLite:
-```js
-import * as sql from 'Module/sqlite';
-const db = await sql.openInMemory();
-await sql.exec(db, 'create table t(x)');
-await sql.exec(db, "insert into t values('hello')");
-const rows = await sql.query(db, 'select * from t');
-```
+## Write your own native plugin
 
-WebSocket:
-```js
-import * as ws from 'Module/ws';
-const sock = ws.create({ url: 'wss://echo.websocket.org', onMessage: m => print('msg', m) });
-sock.start();
-sock.send('hello');
-```
+Start with the [SQLite implementation](sqlite/src/module.cpp) for a compact
+example of module exports, a worker queue, promises, and cleanup. The
+[HTTP implementation](http/src/module.cpp) shows script-thread task dispatch;
+[FFmpeg](ffmpeg/src/module.cpp) shows asset and rendering capabilities.
 
-### Included plugins
+1. Create a C++ module and include `sdk/quickjs/quickjs.h` and
+   `sdk/helix/plugin.h`. The optional `sdk/plugin_support.hpp` helper wraps
+   capability discovery for the examples in this repository.
+2. Export `helix_plugin_integrate`, create the JavaScript module with
+   `JS_NewCModule`, and declare its exports with `JS_AddModuleExport`.
+   Populate those exports in the module initializer with `JS_SetModuleExport`.
+3. Allocate state for each integration and return a `HelixPluginInstance`.
+   Keep connections, queues, promises, callbacks, and workers in that instance
+   so multiple runtimes can use the same library independently.
+4. Keep blocking work on worker threads. Settle promises and invoke JavaScript
+   callbacks on the owning script thread through `scriptUpdate` or the script
+   scheduling capability. Discover asset and rendering services when needed.
+5. Stop and join workers during shutdown, free JavaScript values on the script
+   thread, and release the instance in `destroy`. Make shutdown idempotent.
+6. Build a shared library named `libhx-<name>` with the `sdk/` include directory,
+   then load it from JavaScript as `Module/<name>` in the target engine.
 
-- DBus: Background thread pumps messages; promises resolved during `script:update`.
-- HTTP: Async HTTP(S) requests with a worker thread and a small Promise API.
-- Hypr: IPC bridge to Hyprland sockets for events and commands/JSON queries.
-- Process: Spawn/exec with stdout/stderr streaming, an `exec()` Promise, and access to environment variables.
-- SQLite: Async `exec()` and `query()` using a worker thread.
-- WebSocket: IXWebSocket wrapper with callbacks marshaled to the engine thread.
+The [native plugin ABI guide](docs/plugin-abi.md) documents the entry point,
+capabilities, callback threads, and teardown order. For existing plugins, see
+the [migration guide](docs/native-plugin-migration.md).
 
-Vendored dependencies live under folders like `IXWebSocket/` or `cpp-httplib/`. Comments here focus on the Koya↔plugin boundary, not third‑party internals.
+Meson checks the public ABI header with both C and C++ compilers. Test your
+plugin in the target engine as well: exercise its exports and asynchronous
+operations, shut down while work is pending, and check that separate runtimes
+can release their resources independently.
 
-### Build (against the Koya binary distribution)
+See the [Koya documentation](https://developer.koya-ui.com/) for engine APIs
+and application examples.
 
-These are native modules intended to extend a binary distribution of Koya. You don't need Koya's source to build them.
+## Third-party dependencies
 
-- Ensure you have the Koya SDK bits available at build time: QuickJS headers and the `module_hooks.h` interface (see `sdk/quickjs/` and `module_hooks.h` in this repo).
-- Use Meson from repo root to build all plugins:
-
-```bash
-meson setup build --buildtype=debug
-meson compile -C build -j$(nproc)
-```
-
-- Built modules are produced in `build/<plugin>/` (for example `build/http/libsm-http.so`).
-- CMake files remain available as fallback per-plugin if needed.
-- The output is a shared object exposing `integrateV1(JSContext*, const char*, RegisterHookFunc, const KoyaRendererV1*)` that Koya can discover and load.
-- Consult Koya's distribution docs for where to place the built module and how it is discovered at runtime.
-
-### Create your own plugin
-
-1. Copy a minimal module (e.g., `sqlite/src/module.cpp`).
-2. Implement `integrateV1(...)`, create a JS module with `JS_NewCModule`, and export your API with `JS_SetModuleExport` + `JS_AddModuleExport`.
-3. Keep blocking/async work off-thread; queue results from workers.
-4. Drain queues and settle Promises in `script:update` if you touch QuickJS values. Keep renderer/engine work in engine hooks like `update`/`render_begin`. Release JS values in `script:cleanup` and native resources in `cleanup` as needed.
-5. Build as a shared library; place it where the Koya binary expects modules.
-
-Koya website: [koya-ui.com](https://www.koya-ui.com)
-
-### License
-
-See third‑party licenses in their folders. Plugin sources follow the main Koya project license unless noted.
-
-
+cpp-httplib and IXWebSocket are vendored and built directly by Meson. Their
+upstream build files remain as vendor documentation. See the
+[cpp-httplib license](http/cpp-httplib/LICENSE) and
+[IXWebSocket license](ws/IXWebSocket/LICENSE.txt), along with the notices in
+other vendored sources.

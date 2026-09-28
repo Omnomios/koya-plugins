@@ -40,9 +40,10 @@
 #include <unistd.h>
 #include <fstream>
 #include <filesystem>
+#include <chrono>
 
 #include "../../sdk/quickjs/quickjs.h"
-#include "../../module_hooks.h"
+#include "../../sdk/plugin_support.hpp"
 
 // Tracks a single child process and its pipes/buffers.
 struct ChildProcess {
@@ -57,19 +58,12 @@ struct ChildProcess {
     bool exit_emitted = false;
 };
 
-static std::mutex g_proc_mutex;
-static std::unordered_map<uint32_t, std::unique_ptr<ChildProcess>> g_processes;
-static std::atomic<uint32_t> g_next_id{1};
-static JSContext* g_ctx = nullptr;
-
 // Per-process listener lists for stdout, stderr, and exit events.
 struct ListenerLists {
     std::vector<JSValue> stdout_data;
     std::vector<JSValue> stderr_data;
     std::vector<JSValue> exit_listeners;
 };
-static std::unordered_map<uint32_t, ListenerLists> g_listeners;
-
 struct ExecRequest {
     uint32_t id;
     std::string out;
@@ -77,7 +71,25 @@ struct ExecRequest {
     JSValue resolve;
     JSValue reject;
 };
-static std::unordered_map<uint32_t, ExecRequest> g_exec_requests;
+
+struct ProcessState
+{
+    std::mutex processMutex;
+    std::unordered_map<uint32_t, std::unique_ptr<ChildProcess>> processes;
+    std::atomic<uint32_t> nextId{1};
+    JSContext* context = nullptr;
+    std::unordered_map<uint32_t, ListenerLists> listeners;
+    std::unordered_map<uint32_t, ExecRequest> execRequests;
+};
+
+struct ProcessPlugin : HelixPluginSupport { ProcessState state; };
+static thread_local ProcessState* processState = nullptr;
+#define g_proc_mutex (processState->processMutex)
+#define g_processes (processState->processes)
+#define g_next_id (processState->nextId)
+#define g_ctx (processState->context)
+#define g_listeners (processState->listeners)
+#define g_exec_requests (processState->execRequests)
 
 extern char **environ;
 
@@ -786,17 +798,20 @@ static void process_update_callback(void* /*data*/)
 }
 
 extern "C" {
-// How to extend:
-// - Export `integrateV1` from your shared library.
-// - Wire a `script:update` hook to deliver cross-thread events back to JS.
-// - Wire a `script:cleanup` hook to release OS handles and JS references.
-// - Create your JS module and list named exports with JS_AddModuleExport.
-JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*)
+HELIX_PLUGIN_EXPORT int helix_plugin_integrate(JSContext* ctx, const char* module_name, const HelixPluginHost* host, HelixPluginInstance** out)
 {
+    if(!out) return 1;
+    auto* owner = new ProcessPlugin();
+    if(!owner->initialize(host)) { delete owner; return 1; }
+    processState = &owner->state;
     g_ctx = ctx;
-    registerHook("script:update", process_update_callback);
+    owner->instance.scriptUpdate = [](void* opaque, const HelixPluginUpdate*) {
+        processState = &static_cast<ProcessPlugin*>(opaque)->state;
+        process_update_callback(nullptr);
+    };
     // Ensure we release all JSValue references and OS resources on engine cleanup
-    registerHook("script:cleanup", [](void* /*data*/){
+    owner->instance.scriptShutdown = [](void* opaque){
+        processState = &static_cast<ProcessPlugin*>(opaque)->state;
         // Free pending exec resolve/reject functions
         {
             std::lock_guard<std::mutex> lk(g_proc_mutex);
@@ -837,13 +852,22 @@ JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFu
         }
         // Reap children
         for (auto &ip : ids_and_pids) {
-            int status = 0; (void)status; waitpid(ip.second, &status, 0);
+            int status = 0;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            while(waitpid(ip.second, &status, WNOHANG) == 0 && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            if(waitpid(ip.second, &status, WNOHANG) == 0) {
+                ::kill(ip.second, SIGKILL);
+                (void)waitpid(ip.second, &status, 0);
+            }
         }
         // Clear maps
         g_processes.clear();
-    });
+        g_ctx = nullptr;
+    };
     JSModuleDef* m = JS_NewCModule(ctx, module_name, process_module_init);
-    if(!m) return nullptr;
+    if(!m) { processState = nullptr; delete owner; return 1; }
     JS_AddModuleExport(ctx, m, "spawn");
     JS_AddModuleExport(ctx, m, "exec");
     JS_AddModuleExport(ctx, m, "writeFile");
@@ -853,8 +877,11 @@ JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFu
     JS_AddModuleExport(ctx, m, "drain");
     JS_AddModuleExport(ctx, m, "getEnv");
     JS_AddModuleExport(ctx, m, "env");
-    return m;
+    owner->instance.abiVersion = HELIX_PLUGIN_ABI_VERSION;
+    owner->instance.module = m;
+    owner->instance.state = owner;
+    owner->instance.destroy = [](void* state) { delete static_cast<ProcessPlugin*>(state); };
+    *out = &owner->instance;
+    return 0;
 }
 }
-
-

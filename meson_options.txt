@@ -1,0 +1,28 @@
+option(
+  'plugins',
+  type: 'array',
+  value: ['all'],
+  choices: ['all', 'dbus', 'ffmpeg', 'http', 'hypr', 'pam', 'process', 'sqlite', 'ws'],
+  description: 'Helix plugins to build; use all for release builds',
+)
+
+option(
+  'http_tls',
+  type: 'feature',
+  value: 'auto',
+  description: 'Enable OpenSSL HTTPS support for hx-http (Windows uses WinHTTP)',
+)
+
+option(
+  'quickjs_library',
+  type: 'string',
+  value: '',
+  description: 'Path to a matching QuickJS library; required on Windows, optional on Unix',
+)
+
+option(
+  'lifecycle_test_runner',
+  type: 'string',
+  value: '',
+  description: 'Path to helix_plugin_two_runtime_lifecycle built in the Helix source tree',
+)

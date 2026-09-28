@@ -30,7 +30,7 @@
 #include <condition_variable>
 
 #include "../../sdk/quickjs/quickjs.h"
-#include "../../sdk/module_hooks.h"
+#include "../../sdk/plugin_support.hpp"
 #include <functional>
 
 // RAII wrapper for sqlite3* handle tracked by id.
@@ -38,20 +38,12 @@ struct SqliteDbHandle {
     sqlite3* db = nullptr;
 };
 
-static std::mutex g_sql_mutex;
-static std::unordered_map<uint32_t, std::unique_ptr<SqliteDbHandle>> g_dbs;
-static uint32_t g_next_db_id = 1;
-static JSContext* g_ctx = nullptr;
-
 // Async worker infrastructure
 // Background job types processed by the worker thread.
 enum class JobType { Exec, Query };
 struct JobExec { uint32_t id; std::string sql; JSValue resolve; JSValue reject; };
 struct JobQuery { uint32_t id; std::string sql; JSValue resolve; JSValue reject; };
 struct Job { JobType type; JobExec e; JobQuery q; };
-static std::mutex g_job_mutex;
-static std::condition_variable g_job_cv;
-static std::queue<Job> g_jobs;
 // Row with (name,value,type) pairs preserving SQLite types
 enum class SqliteValueType { Null, Integer, Float, Text, Blob };
 struct QueryResultColumn {
@@ -73,10 +65,39 @@ struct QueryResult {
 struct ExecResult {
     bool ok; int code; std::string message;
 };
-static std::queue<std::function<void()>> g_completions; // run on main thread via update hook
-static std::mutex g_comp_mutex;
-static std::thread g_worker;
-static std::atomic<bool> g_worker_running{false};
+struct Completion {
+    JSValue resolve;
+    JSValue reject;
+    std::function<void()> run;
+};
+struct SqliteState
+{
+    std::mutex sqlMutex;
+    std::unordered_map<uint32_t, std::unique_ptr<SqliteDbHandle>> databases;
+    uint32_t nextDatabaseId = 1;
+    JSContext* context = nullptr;
+    std::mutex jobMutex;
+    std::condition_variable jobChanged;
+    std::queue<Job> jobs;
+    std::queue<Completion> completions;
+    std::mutex completionMutex;
+    std::thread worker;
+    std::atomic<bool> workerRunning{false};
+};
+
+struct SqlitePlugin : HelixPluginSupport { SqliteState state; };
+static thread_local SqliteState* sqliteState = nullptr;
+#define g_sql_mutex (sqliteState->sqlMutex)
+#define g_dbs (sqliteState->databases)
+#define g_next_db_id (sqliteState->nextDatabaseId)
+#define g_ctx (sqliteState->context)
+#define g_job_mutex (sqliteState->jobMutex)
+#define g_job_cv (sqliteState->jobChanged)
+#define g_jobs (sqliteState->jobs)
+#define g_completions (sqliteState->completions)
+#define g_comp_mutex (sqliteState->completionMutex)
+#define g_worker (sqliteState->worker)
+#define g_worker_running (sqliteState->workerRunning)
 
 static void ensure_worker_started();
 
@@ -227,41 +248,78 @@ static int sqlite_module_init(JSContext* ctx, JSModuleDef* m) {
 }
 
 extern "C" {
-// Required entry point
-JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*) {
+HELIX_PLUGIN_EXPORT int helix_plugin_integrate(JSContext* ctx, const char* module_name, const HelixPluginHost* host, HelixPluginInstance** out) {
+    if(!out) return 1;
+    auto* owner = new SqlitePlugin();
+    if(!owner->initialize(host)) { delete owner; return 1; }
+    sqliteState = &owner->state;
     g_ctx = ctx;
-        // Hook: script:update — runs completions (Promise resolve/reject) on script thread.
-        registerHook("script:update", [](void*){
-        std::queue<std::function<void()>> local;
+    owner->instance.scriptUpdate = [](void* opaque, const HelixPluginUpdate*) {
+        sqliteState = &static_cast<SqlitePlugin*>(opaque)->state;
+        std::queue<Completion> local;
         {
             std::lock_guard<std::mutex> lk(g_comp_mutex);
             std::swap(local, g_completions);
         }
-        while(!local.empty()) { local.front()(); local.pop(); }
-    });
-    registerHook("script:cleanup", [](void*){
+        while(!local.empty()) { local.front().run(); local.pop(); }
+    };
+    owner->instance.scriptShutdown = [](void* opaque) {
+        sqliteState = &static_cast<SqlitePlugin*>(opaque)->state;
         g_worker_running = false;
         g_job_cv.notify_all();
         if (g_worker.joinable()) g_worker.join();
-        // free any pending completion lambdas by draining
-        std::queue<std::function<void()>> drain;
+        std::queue<Job> abandonedJobs;
+        {
+            std::lock_guard<std::mutex> lk(g_job_mutex);
+            std::swap(abandonedJobs, g_jobs);
+        }
+        while(!abandonedJobs.empty()) {
+            Job& job = abandonedJobs.front();
+            JSValue resolve = job.type == JobType::Exec ? job.e.resolve : job.q.resolve;
+            JSValue reject = job.type == JobType::Exec ? job.e.reject : job.q.reject;
+            JS_FreeValue(g_ctx, resolve);
+            JS_FreeValue(g_ctx, reject);
+            abandonedJobs.pop();
+        }
+        std::queue<Completion> drain;
         {
             std::lock_guard<std::mutex> lk(g_comp_mutex);
             std::swap(drain, g_completions);
         }
-    });
+        while(!drain.empty()) {
+            JS_FreeValue(g_ctx, drain.front().resolve);
+            JS_FreeValue(g_ctx, drain.front().reject);
+            drain.pop();
+        }
+        std::unordered_map<uint32_t, std::unique_ptr<SqliteDbHandle>> databases;
+        {
+            std::lock_guard<std::mutex> lk(g_sql_mutex);
+            databases.swap(g_dbs);
+        }
+        for(auto& [id, handle] : databases) {
+            (void)id;
+            if(handle && handle->db) sqlite3_close(handle->db);
+        }
+        g_ctx = nullptr;
+    };
     JSModuleDef* m = JS_NewCModule(ctx, module_name, sqlite_module_init);
-    if (!m) return nullptr;
+    if (!m) { owner->instance.scriptShutdown(owner); sqliteState = nullptr; delete owner; return 1; }
     JS_AddModuleExport(ctx, m, "open");
     JS_AddModuleExport(ctx, m, "openInMemory");
     JS_AddModuleExport(ctx, m, "close");
     JS_AddModuleExport(ctx, m, "exec");
     JS_AddModuleExport(ctx, m, "query");
-    return m;
+    owner->instance.abiVersion = HELIX_PLUGIN_ABI_VERSION;
+    owner->instance.module = m;
+    owner->instance.state = owner;
+    owner->instance.destroy = [](void* state) { delete static_cast<SqlitePlugin*>(state); };
+    *out = &owner->instance;
+    return 0;
 }
 }
 
-static void worker_thread_body() {
+static void worker_thread_body(SqliteState* state) {
+    sqliteState = state;
     while (g_worker_running) {
         Job job;
         {
@@ -296,8 +354,7 @@ static void worker_thread_body() {
             {
                 std::lock_guard<std::mutex> lk(g_comp_mutex);
                 JSValue resolve = job.e.resolve; JSValue reject = job.e.reject;
-                g_completions.push([resolve, reject, res]() mutable {
-                    if (!g_ctx) { JS_FreeValueRT(JS_GetRuntime(g_ctx), resolve); JS_FreeValueRT(JS_GetRuntime(g_ctx), reject); return; }
+                g_completions.push(Completion{resolve, reject, [resolve, reject, res]() mutable {
                     if (res.ok) {
                         JSValue undef = JS_UNDEFINED;
                         JSValue ret = JS_Call(g_ctx, resolve, JS_UNDEFINED, 1, &undef);
@@ -312,7 +369,7 @@ static void worker_thread_body() {
                     }
                     JS_FreeValue(g_ctx, resolve);
                     JS_FreeValue(g_ctx, reject);
-                });
+                }});
             }
         } else if (job.type == JobType::Query) {
             QueryResult res; res.ok = true; res.code = SQLITE_OK;
@@ -379,8 +436,7 @@ static void worker_thread_body() {
             {
                 std::lock_guard<std::mutex> lk(g_comp_mutex);
                 JSValue resolve = job.q.resolve; JSValue reject = job.q.reject;
-                g_completions.push([resolve, reject, res]() mutable {
-                    if (!g_ctx) { JS_FreeValueRT(JS_GetRuntime(g_ctx), resolve); JS_FreeValueRT(JS_GetRuntime(g_ctx), reject); return; }
+                g_completions.push(Completion{resolve, reject, [resolve, reject, res]() mutable {
                     if (res.ok) {
                         JSValue arr = JS_NewArray(g_ctx);
                         uint32_t idx = 0;
@@ -426,7 +482,7 @@ static void worker_thread_body() {
                     }
                     JS_FreeValue(g_ctx, resolve);
                     JS_FreeValue(g_ctx, reject);
-                });
+                }});
             }
         }
     }
@@ -435,7 +491,5 @@ static void worker_thread_body() {
 static void ensure_worker_started() {
     if (g_worker_running) return;
     g_worker_running = true;
-    g_worker = std::thread(worker_thread_body);
+    g_worker = std::thread(worker_thread_body, sqliteState);
 }
-
-

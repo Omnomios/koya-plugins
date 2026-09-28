@@ -25,7 +25,7 @@
 #include <security/pam_appl.h>
 
 #include "../../sdk/quickjs/quickjs.h"
-#include "../../sdk/module_hooks.h"
+#include "../../sdk/plugin_support.hpp"
 
 namespace {
 
@@ -49,20 +49,37 @@ struct PendingPromise {
     JSValue reject;
 };
 
-static std::atomic<uint32_t> g_nextId{1};
-static std::mutex g_reqMutex;
-static std::condition_variable g_reqCv;
-static std::queue<AuthRequest> g_requests;
+struct PamState {
+    std::atomic<uint32_t> nextId{1};
+    std::mutex requestMutex;
+    std::condition_variable requestCv;
+    std::queue<AuthRequest> requests;
+    std::mutex resultMutex;
+    std::queue<AuthResult> results;
+    std::mutex promiseMutex;
+    std::unordered_map<uint32_t, PendingPromise> promises;
+    std::atomic<bool> running{false};
+    std::thread worker;
+    JSContext* context = nullptr;
+};
 
-static std::mutex g_resMutex;
-static std::queue<AuthResult> g_results;
+static thread_local PamState* pamState = nullptr;
 
-static std::mutex g_promMutex;
-static std::unordered_map<uint32_t, PendingPromise> g_promises;
+#define g_nextId (pamState->nextId)
+#define g_reqMutex (pamState->requestMutex)
+#define g_reqCv (pamState->requestCv)
+#define g_requests (pamState->requests)
+#define g_resMutex (pamState->resultMutex)
+#define g_results (pamState->results)
+#define g_promMutex (pamState->promiseMutex)
+#define g_promises (pamState->promises)
+#define g_running (pamState->running)
+#define g_worker (pamState->worker)
+#define g_ctx (pamState->context)
 
-static std::atomic<bool> g_running{false};
-static std::thread g_worker;
-static JSContext* g_ctx = nullptr;
+struct PamPlugin : HelixPluginSupport {
+    PamState runtime;
+};
 
 static int conv_func(int num_msg, const struct pam_message** msg, struct pam_response** resp, void* appdata_ptr)
 {
@@ -100,8 +117,9 @@ static int conv_func(int num_msg, const struct pam_message** msg, struct pam_res
     return PAM_SUCCESS;
 }
 
-static void worker_loop()
+static void worker_loop(PamState* state)
 {
+    pamState = state;
     while (g_running.load()) {
         AuthRequest req;
         {
@@ -140,6 +158,7 @@ static void worker_loop()
             g_results.push(AuthResult{req.id, finalCode, ok, std::move(message)});
         }
     }
+    pamState = nullptr;
 }
 
 static std::string js_to_string(JSContext* ctx, JSValueConst v) {
@@ -222,43 +241,60 @@ static void pam_update(void*)
     }
 }
 
+static void pam_shutdown(PamState* state)
+{
+    pamState = state;
+    g_running.store(false);
+    g_reqCv.notify_all();
+    if(g_worker.joinable()) g_worker.join();
+    {
+        std::lock_guard<std::mutex> lk(g_promMutex);
+        for (auto &kv : g_promises) {
+            JS_FreeValue(g_ctx, kv.second.resolve);
+            JS_FreeValue(g_ctx, kv.second.reject);
+        }
+        g_promises.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_resMutex);
+        while (!g_results.empty()) g_results.pop();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_reqMutex);
+        while (!g_requests.empty()) g_requests.pop();
+    }
+    g_ctx = nullptr;
+    pamState = nullptr;
+}
+
 } // namespace
 
 extern "C" {
-JSModuleDef* integrateV1(JSContext* ctx, const char* module_name, RegisterHookFunc registerHook, const KoyaRendererV1*)
+HELIX_PLUGIN_EXPORT int helix_plugin_integrate(JSContext* ctx, const char* module_name, const HelixPluginHost* host, HelixPluginInstance** out)
 {
+    if(!out) return 1;
+    auto* owner = new PamPlugin();
+    if(!owner->initialize(host)) { delete owner; return 1; }
+    pamState = &owner->runtime;
     g_ctx = ctx;
     if (!g_running.exchange(true)) {
-        g_worker = std::thread(worker_loop);
-        g_worker.detach();
+        g_worker = std::thread(worker_loop, &owner->runtime);
     }
-    registerHook("script:update", pam_update);
-    registerHook("script:cleanup", [](void*){
-        g_running.store(false);
-        g_reqCv.notify_all();
-        {
-            std::lock_guard<std::mutex> lk(g_promMutex);
-            for (auto &kv : g_promises) {
-                JS_FreeValue(g_ctx, kv.second.resolve);
-                JS_FreeValue(g_ctx, kv.second.reject);
-            }
-            g_promises.clear();
-        }
-        {
-            std::lock_guard<std::mutex> lk(g_resMutex);
-            while (!g_results.empty()) g_results.pop();
-        }
-        {
-            std::lock_guard<std::mutex> lk(g_reqMutex);
-            while (!g_requests.empty()) g_requests.pop();
-        }
-        g_ctx = nullptr;
-    });
+    owner->instance.scriptUpdate = [](void* state, const HelixPluginUpdate*) {
+        pamState = &static_cast<PamPlugin*>(state)->runtime;
+        pam_update(nullptr);
+    };
+    owner->instance.scriptShutdown = [](void* state){
+        pam_shutdown(&static_cast<PamPlugin*>(state)->runtime);
+    };
     JSModuleDef* m = JS_NewCModule(ctx, module_name, pam_module_init);
-    if (!m) return nullptr;
+    if (!m) { pam_shutdown(&owner->runtime); delete owner; return 1; }
     JS_AddModuleExport(ctx, m, "authenticate");
-    return m;
+    owner->instance.abiVersion = HELIX_PLUGIN_ABI_VERSION;
+    owner->instance.module = m;
+    owner->instance.state = owner;
+    owner->instance.destroy = [](void* state) { delete static_cast<PamPlugin*>(state); };
+    *out = &owner->instance;
+    return 0;
 }
 }
-
-
