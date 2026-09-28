@@ -17,6 +17,7 @@
        - addMatch(rule)
        - call(dest, path, iface, method[, signature, ...args]) -> Promise<string>
        - onSignal(cb), offSignal(cb?)
+       - session / system: independent handles with the same methods
 
    Integration points you can copy for your own plugins:
    - the canonical integration entry point creates a JS module and
@@ -34,6 +35,7 @@
      Koya plugin shape, not a full DBus surface.
 */
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <chrono>
@@ -81,7 +83,8 @@ struct SignalItem {
     std::string iface;
     std::string member;
     std::string signature;
-    std::string body; // simple debug string; consumers can parse further
+    std::string body; // first argument as text (composites are JSON)
+    std::string argsJson; // all arguments, recursively decoded
 };
 
 struct DbusState {
@@ -102,7 +105,7 @@ struct DbusState {
     std::atomic<bool> running{false};
     std::atomic<bool> connecting{false};
     std::atomic<bool> shuttingDown{false};
-    DBusConnection* connection = nullptr;
+    std::atomic<DBusConnection*> connection{nullptr};
     BusType busType = BusType::Session;
     std::mutex connectWaitersMutex;
     std::vector<uint32_t> connectWaiterIds;
@@ -137,7 +140,19 @@ static thread_local DbusState* dbusState = nullptr;
 #define g_debug (dbusState->debug)
 
 struct DbusPlugin : HelixPluginSupport {
-    DbusState runtime;
+    DbusState runtime; // backwards-compatible module-level connection
+    DbusState session;
+    DbusState system;
+};
+
+// Module initialization can be deferred; resolve its owner by context, not TLS.
+static std::mutex pluginOwnersMutex;
+static std::unordered_map<JSContext*, DbusPlugin*> pluginOwners;
+
+struct StateScope {
+    DbusState* previous;
+    explicit StateScope(DbusState* state) : previous(dbusState) { dbusState = state; }
+    ~StateScope() { dbusState = previous; }
 };
 
 static std::string js_to_string(JSContext* ctx, JSValueConst v) {
@@ -185,14 +200,14 @@ static std::string dbus_basic_to_string(int type, DBusMessageIter* it) {
             dbus_bool_t b; dbus_message_iter_get_basic(it, &b);
             return b ? "true" : "false";
         }
-        case DBUS_TYPE_BYTE: { unsigned int v; dbus_message_iter_get_basic(it, &v); return std::to_string(v); }
+        case DBUS_TYPE_BYTE: { uint8_t v; dbus_message_iter_get_basic(it, &v); return std::to_string(v); }
         case DBUS_TYPE_INT16: { int16_t v; dbus_message_iter_get_basic(it, &v); return std::to_string(v); }
         case DBUS_TYPE_UINT16:{ uint16_t v; dbus_message_iter_get_basic(it, &v); return std::to_string(v); }
         case DBUS_TYPE_INT32: { int32_t v; dbus_message_iter_get_basic(it, &v); return std::to_string(v); }
         case DBUS_TYPE_UINT32:{ uint32_t v; dbus_message_iter_get_basic(it, &v); return std::to_string(v); }
         case DBUS_TYPE_INT64: { long long v; dbus_message_iter_get_basic(it, &v); return std::to_string(v); }
         case DBUS_TYPE_UINT64:{ unsigned long long v; dbus_message_iter_get_basic(it, &v); return std::to_string(v); }
-        case DBUS_TYPE_DOUBLE:{ double v; dbus_message_iter_get_basic(it, &v); char buf[64]; snprintf(buf,sizeof(buf),"%g",v); return std::string(buf); }
+        case DBUS_TYPE_DOUBLE:{ double v; dbus_message_iter_get_basic(it, &v); if (!std::isfinite(v)) return "null"; char buf[64]; snprintf(buf,sizeof(buf),"%.17g",v); return std::string(buf); }
         case DBUS_TYPE_SIGNATURE: {
             const char* s; dbus_message_iter_get_basic(it, &s);
             return s ? std::string(s) : std::string();
@@ -208,25 +223,18 @@ static void dbus_array_to_json(std::string& out, DBusMessageIter* it) {
     int elem = dbus_message_iter_get_element_type(it);
     DBusMessageIter sub; dbus_message_iter_recurse(it, &sub);
     if (elem == DBUS_TYPE_DICT_ENTRY) {
-        // a{sv}
+        // Any dictionary signature: recurse into values, including a{sa{sv}}.
         out.push_back('{');
         bool first = true;
         while (dbus_message_iter_get_arg_type(&sub) == DBUS_TYPE_DICT_ENTRY) {
             DBusMessageIter dict; dbus_message_iter_recurse(&sub, &dict);
-            const char* key = "";
-            if (dbus_message_iter_get_arg_type(&dict) == DBUS_TYPE_STRING) {
-                dbus_message_iter_get_basic(&dict, &key);
-                dbus_message_iter_next(&dict);
-            }
-            if (!first) out.push_back(','); first = false;
-            json_append_escaped(out, key ? key : "");
+            std::string key = dbus_basic_to_string(dbus_message_iter_get_arg_type(&dict), &dict);
+            dbus_message_iter_next(&dict);
+            if (!first) out.push_back(',');
+            first = false;
+            json_append_escaped(out, key.c_str());
             out.push_back(':');
-            if (dbus_message_iter_get_arg_type(&dict) == DBUS_TYPE_VARIANT) {
-                DBusMessageIter var; dbus_message_iter_recurse(&dict, &var);
-                dbus_value_to_json(out, &var);
-            } else {
-                out += "null";
-            }
+            dbus_value_to_json(out, &dict);
             dbus_message_iter_next(&sub);
         }
         out.push_back('}');
@@ -235,7 +243,8 @@ static void dbus_array_to_json(std::string& out, DBusMessageIter* it) {
         out.push_back('[');
         bool first = true;
         while (dbus_message_iter_get_arg_type(&sub) != DBUS_TYPE_INVALID) {
-            if (!first) out.push_back(','); first = false;
+            if (!first) out.push_back(',');
+            first = false;
             dbus_value_to_json(out, &sub);
             dbus_message_iter_next(&sub);
         }
@@ -249,7 +258,8 @@ static void dbus_struct_to_json(std::string& out, DBusMessageIter* it) {
     out.push_back('[');
     bool first = true;
     while (dbus_message_iter_get_arg_type(&sub) != DBUS_TYPE_INVALID) {
-        if (!first) out.push_back(','); first = false;
+        if (!first) out.push_back(',');
+        first = false;
         dbus_value_to_json(out, &sub);
         dbus_message_iter_next(&sub);
     }
@@ -293,146 +303,131 @@ static uint64_t now_ms() {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-// Background I/O loop. Runs on g_pumpThread, pulls messages and enqueues
-// lightweight records for delivery during the `update` hook.
+// Decode on the I/O thread without touching JS values.
+static ReplyItem decode_reply(DBusMessage* msg, uint32_t id) {
+    ReplyItem reply;
+    reply.id = id;
+    reply.ok = dbus_message_get_type(msg) != DBUS_MESSAGE_TYPE_ERROR;
+    if (!reply.ok) {
+        const char* name = dbus_message_get_error_name(msg);
+        reply.payload = std::string("ERROR:") + (name ? name : "unknown");
+        return reply;
+    }
+    DBusMessageIter iter;
+    if (!dbus_message_iter_init(msg, &iter)) return reply;
+    DBusMessageIter value = iter;
+    while (dbus_message_iter_get_arg_type(&value) == DBUS_TYPE_VARIANT) {
+        DBusMessageIter sub; dbus_message_iter_recurse(&value, &sub);
+        value = sub;
+    }
+    int type = dbus_message_iter_get_arg_type(&value);
+    if (type == DBUS_TYPE_ARRAY && dbus_message_iter_get_element_type(&value) == DBUS_TYPE_BYTE) {
+        reply.isBytes = true;
+        DBusMessageIter sub; dbus_message_iter_recurse(&value, &sub);
+        while (dbus_message_iter_get_arg_type(&sub) == DBUS_TYPE_BYTE) {
+            uint8_t byte; dbus_message_iter_get_basic(&sub, &byte);
+            reply.bytesPayload.push_back(byte);
+            dbus_message_iter_next(&sub);
+        }
+    } else if (type == DBUS_TYPE_ARRAY || type == DBUS_TYPE_STRUCT) {
+        reply.isJson = true;
+        dbus_value_to_json(reply.payload, &value);
+    } else {
+        reply.payload = dbus_basic_to_string(type, &value);
+    }
+    return reply;
+}
+
+static SignalItem decode_signal(DBusMessage* msg) {
+    SignalItem signal;
+    signal.sender = dbus_message_get_sender(msg) ? dbus_message_get_sender(msg) : "";
+    signal.path = dbus_message_get_path(msg) ? dbus_message_get_path(msg) : "";
+    signal.iface = dbus_message_get_interface(msg) ? dbus_message_get_interface(msg) : "";
+    signal.member = dbus_message_get_member(msg) ? dbus_message_get_member(msg) : "";
+    signal.signature = dbus_message_get_signature(msg) ? dbus_message_get_signature(msg) : "";
+    signal.argsJson = "[";
+    DBusMessageIter iter;
+    if (dbus_message_iter_init(msg, &iter)) {
+        int type = dbus_message_iter_get_arg_type(&iter);
+        if (type == DBUS_TYPE_ARRAY || type == DBUS_TYPE_STRUCT || type == DBUS_TYPE_VARIANT) {
+            dbus_value_to_json(signal.body, &iter);
+        } else {
+            signal.body = dbus_basic_to_string(type, &iter);
+        }
+        bool first = true;
+        do {
+            if (!first) signal.argsJson.push_back(',');
+            first = false;
+            dbus_value_to_json(signal.argsJson, &iter);
+        } while (dbus_message_iter_next(&iter));
+    }
+    signal.argsJson.push_back(']');
+    return signal;
+}
+
+// Background I/O loop. JS delivery happens in the update hook.
 static void pump_loop(DbusState* state) {
-    dbusState = state;
+    StateScope scope(state);
     while (g_running.load()) {
         DBusConnection* conn = g_conn;
         if (!conn) break;
-        // Poll for up to 50ms, then drain ALL available messages to avoid backlog-induced latency
-        dbus_connection_read_write(conn, 50 /* ms */);
+        dbus_connection_read_write(conn, 50);
         for (;;) {
             std::lock_guard<std::mutex> iolk(g_busIoMutex);
             DBusMessage* msg = dbus_connection_pop_message(conn);
             if (!msg) break;
             int type = dbus_message_get_type(msg);
-        if (type == DBUS_MESSAGE_TYPE_METHOD_RETURN || type == DBUS_MESSAGE_TYPE_ERROR) {
-            // Correlate reply using DBus reply serial captured at send time
-            uint32_t reply_serial = dbus_message_get_reply_serial(msg);
-            const char* errname = type == DBUS_MESSAGE_TYPE_ERROR ? dbus_message_get_error_name(msg) : nullptr;
-            DBusMessageIter iter;
-            dbus_message_iter_init(msg, &iter);
-            std::string out;
-            if (errname) {
-                out = std::string("ERROR:") + errname;
-            } else if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_INVALID) {
-                int argt = dbus_message_iter_get_arg_type(&iter);
-                // ay or variant(ay) → enqueue as bytesReply and continue
-                if ((argt == DBUS_TYPE_ARRAY && dbus_message_iter_get_element_type(&iter) == DBUS_TYPE_BYTE) || argt == DBUS_TYPE_VARIANT) {
-                    DBusMessageIter arrIt;
-                    if (argt == DBUS_TYPE_VARIANT) {
-                        DBusMessageIter sub; dbus_message_iter_recurse(&iter, &sub);
-                        if (dbus_message_iter_get_arg_type(&sub) == DBUS_TYPE_ARRAY && dbus_message_iter_get_element_type(&sub) == DBUS_TYPE_BYTE) {
-                            arrIt = sub;
-                        } else {
-                            goto not_bytes_path;
-                        }
-                    } else {
-                        arrIt = iter;
-                    }
-                    // Map reply id now
-                    uint32_t bid = 0;
-                    if (reply_serial != 0) {
-                        std::lock_guard<std::mutex> lk(g_serialMapMutex);
-                        auto it = g_serialToPromiseId.find(reply_serial);
-                        if (it != g_serialToPromiseId.end()) { bid = it->second; g_serialToPromiseId.erase(it); }
-                    }
-                    if (bid != 0) {
-                        DBusMessageIter sub2; dbus_message_iter_recurse(&arrIt, &sub2);
-                        ReplyItem ri; ri.id = bid; ri.ok = (errname == nullptr); ri.isBytes = true;
-                        while (dbus_message_iter_get_arg_type(&sub2) == DBUS_TYPE_BYTE) {
-                            unsigned int v = 0; dbus_message_iter_get_basic(&sub2, &v);
-                            ri.bytesPayload.push_back(static_cast<uint8_t>(v & 0xFF));
-                            dbus_message_iter_next(&sub2);
-                        }
-                        std::lock_guard<std::mutex> lk2(g_replyMutex);
-                        g_replies.push(std::move(ri));
-                        dbus_message_unref(msg);
-                        continue;
+            if (type == DBUS_MESSAGE_TYPE_METHOD_RETURN || type == DBUS_MESSAGE_TYPE_ERROR) {
+                uint32_t serial = dbus_message_get_reply_serial(msg);
+                uint32_t id = 0;
+                {
+                    std::lock_guard<std::mutex> lk(g_serialMapMutex);
+                    auto it = g_serialToPromiseId.find(serial);
+                    if (it != g_serialToPromiseId.end()) {
+                        id = it->second;
+                        g_serialToPromiseId.erase(it);
                     }
                 }
-not_bytes_path:
-                // Simple basic types returned raw; composite types returned as JSON
-                if (argt == DBUS_TYPE_STRING || argt == DBUS_TYPE_OBJECT_PATH || argt == DBUS_TYPE_SIGNATURE ||
-                    argt == DBUS_TYPE_BOOLEAN || argt == DBUS_TYPE_BYTE || argt == DBUS_TYPE_INT16 || argt == DBUS_TYPE_UINT16 ||
-                    argt == DBUS_TYPE_INT32 || argt == DBUS_TYPE_UINT32 || argt == DBUS_TYPE_INT64 || argt == DBUS_TYPE_UINT64 || argt == DBUS_TYPE_DOUBLE) {
-                    out = dbus_basic_to_string(argt, &iter);
-                    if (argt == DBUS_TYPE_STRING || argt == DBUS_TYPE_OBJECT_PATH || argt == DBUS_TYPE_SIGNATURE) {
-                        const char* s = nullptr; dbus_message_iter_get_basic(&iter, &s); out = s ? s : "";
-                    }
-                } else {
-                    std::string json; dbus_value_to_json(json, &iter); out = std::move(json);
+                if (id) {
+                    ReplyItem reply = decode_reply(msg, id);
+                    if (g_debug) fprintf(stderr, "dbus recv: reply_serial=%u id=%u ok=%d\n", serial, id, reply.ok);
+                    std::lock_guard<std::mutex> lk(g_replyMutex);
+                    g_replies.push(std::move(reply));
                 }
+            } else if (type == DBUS_MESSAGE_TYPE_SIGNAL) {
+                SignalItem signal = decode_signal(msg);
+                std::lock_guard<std::mutex> lk(g_sigMutex);
+                g_signals.push(std::move(signal));
             }
-            // Deliver to the matching promise if mapping exists
-            uint32_t id = 0;
-            if (reply_serial != 0) {
-                std::lock_guard<std::mutex> lk(g_serialMapMutex);
-                auto it = g_serialToPromiseId.find(reply_serial);
-                if (it != g_serialToPromiseId.end()) {
-                    id = it->second;
-                    g_serialToPromiseId.erase(it);
-                }
-            }
-            if (id != 0) {
-                std::lock_guard<std::mutex> lk(g_replyMutex);
-                ReplyItem ri; ri.id = id; ri.ok = (errname == nullptr);
-                // Mark composite replies as JSON (non-empty and starts with '{' or '[')
-                if (!out.empty() && (out[0] == '{' || out[0] == '[')) { ri.isJson = true; }
-                ri.payload = std::move(out);
-                g_replies.push(std::move(ri));
-            }
-            if (g_debug) {
-                fprintf(stderr, "dbus recv: reply_serial=%u -> id=%u ok=%d payload_len=%zu err=%s\n",
-                        reply_serial, id, errname == nullptr, out.size(), errname ? errname : "");
-            }
-        } else if (type == DBUS_MESSAGE_TYPE_SIGNAL) {
-            SignalItem si;
-            si.sender = dbus_message_get_sender(msg) ? dbus_message_get_sender(msg) : "";
-            si.path = dbus_message_get_path(msg) ? dbus_message_get_path(msg) : "";
-            si.iface = dbus_message_get_interface(msg) ? dbus_message_get_interface(msg) : "";
-            si.member = dbus_message_get_member(msg) ? dbus_message_get_member(msg) : "";
-            si.signature = dbus_message_get_signature(msg) ? dbus_message_get_signature(msg) : "";
-            DBusMessageIter iter;
-            dbus_message_iter_init(msg, &iter);
-            if (dbus_message_iter_get_arg_type(&iter) == DBUS_TYPE_STRING) {
-                const char* s; dbus_message_iter_get_basic(&iter, &s);
-                si.body = s ? s : "";
-            }
-            std::lock_guard<std::mutex> lk(g_sigMutex);
-            g_signals.push(std::move(si));
-        }
             dbus_message_unref(msg);
         }
     }
-    dbusState = nullptr;
 }
 
 // JS: connect("session"|"system") — asynchronously connects to dbus on a worker
 // thread and starts the pump thread. Returns a Promise<void> that resolves when
 // connected. Avoids blocking the JS/engine thread.
 static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    // If already connected, return immediately
+    BusType type = g_busType;
+    if (argc >= 1 && !JS_IsUndefined(argv[0])) {
+        std::string bus = js_to_string(ctx, argv[0]);
+        if (bus != "session" && bus != "system") return JS_ThrowTypeError(ctx, "bus must be 'session' or 'system'");
+        type = bus == "system" ? BusType::System : BusType::Session;
+    }
+    if ((g_conn != nullptr || g_connecting.load()) && type != g_busType) {
+        return JS_ThrowTypeError(ctx, "already using another bus; use the session and system handles");
+    }
     if (g_conn != nullptr) {
-        // Return an already-resolved Promise for API consistency
         JSValue funcs[2];
         JSValue promise = JS_NewPromiseCapability(ctx, funcs);
-        JSValue resolve = funcs[0];
-        JSValue dummy = JS_NewString(ctx, "");
-        JS_Call(ctx, resolve, JS_UNDEFINED, 1, &dummy);
-        JS_FreeValue(ctx, dummy);
-        JS_FreeValue(ctx, resolve);
+        JSValue result = JS_Call(ctx, funcs[0], JS_UNDEFINED, 0, nullptr);
+        JS_FreeValue(ctx, result);
+        JS_FreeValue(ctx, funcs[0]);
         JS_FreeValue(ctx, funcs[1]);
         return promise;
     }
-    // Initialize libdbus threading once if using threads
+    g_busType = type;
     std::call_once(dbusThreadsOnce, [] { dbus_threads_init_default(); });
-    BusType type = BusType::Session;
-    if (argc >= 1 && JS_IsString(argv[0])) {
-        std::string t = js_to_string(ctx, argv[0]);
-        if (t == "system") type = BusType::System;
-    }
     // Enable debug logging if requested
     if (const char* dbg = getenv("KOYA_DBUS_DEBUG")) {
         g_debug = (dbg[0] != '\0' && dbg[0] != '0');
@@ -450,74 +445,55 @@ static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSVal
         g_promises.emplace(id, PendingPromise{ctx, resolve, reject, now_ms(), 3000});
     }
 
-    // Queue as a waiter and start a single background connect if not already in-flight
+    // Synchronize waiter registration with worker completion, including a
+    // connection that completed between the initial check and this lock.
     {
         std::lock_guard<std::mutex> lk(g_connectWaitersMutex);
+        if (g_conn) {
+            ReplyItem reply; reply.id = id; reply.ok = true;
+            std::lock_guard<std::mutex> replyLock(g_replyMutex);
+            g_replies.push(std::move(reply));
+            return promise;
+        }
         g_connectWaiterIds.push_back(id);
-    }
-    bool expectedConnecting = false;
-    if (!g_connecting.compare_exchange_strong(expectedConnecting, true)) {
-        return promise; // another connect is in flight; we'll resolve when it finishes
+        if (g_connecting.exchange(true)) return promise;
     }
 
     if (g_connectThread.joinable()) g_connectThread.join();
     DbusState* state = dbusState;
     g_connectThread = std::thread([state, type]() {
-    dbusState = state;
-    DBusError err; dbus_error_init(&err);
-    DBusConnection* conn = dbus_bus_get(type == BusType::System ? DBUS_BUS_SYSTEM : DBUS_BUS_SESSION, &err);
-    if (!conn) {
-        std::string e = err.message ? err.message : "failed to connect to bus";
-        dbus_error_free(&err);
-            // Notify all waiters of failure
-            std::vector<uint32_t> waiters;
-            {
-                std::lock_guard<std::mutex> lk(g_connectWaitersMutex);
-                waiters.swap(g_connectWaiterIds);
-            }
-            if (!waiters.empty()) {
-                std::lock_guard<std::mutex> lk(g_replyMutex);
-                for (uint32_t wid : waiters) {
-                    ReplyItem ri; ri.id = wid; ri.ok = false; ri.payload = e;
-                    g_replies.push(std::move(ri));
-                }
-            }
-            g_connecting.store(false);
-            dbusState = nullptr;
-            return;
-        }
-        if (dbusState->shuttingDown.load()) {
+        StateScope scope(state);
+        DBusError err; dbus_error_init(&err);
+        DBusConnection* conn = dbus_bus_get_private(type == BusType::System ? DBUS_BUS_SYSTEM : DBUS_BUS_SESSION, &err);
+        std::string error;
+        if (!conn) {
+            error = err.message ? err.message : "failed to connect to bus";
+            dbus_error_free(&err);
+        } else if (state->shuttingDown.load()) {
+            dbus_connection_close(conn);
             dbus_connection_unref(conn);
             g_connecting.store(false);
-            dbusState = nullptr;
             return;
+        } else {
+            dbus_connection_set_exit_on_disconnect(conn, false);
+            g_conn = conn;
+            if (!g_running.exchange(true)) {
+                if (g_pumpThread.joinable()) g_pumpThread.join();
+                g_pumpThread = std::thread([state] { pump_loop(state); });
+            }
+            if (g_debug) fprintf(stderr, "dbus: connected to %s bus\n", type == BusType::System ? "system" : "session");
         }
-        // Do not exit process on disconnect
-        dbus_connection_set_exit_on_disconnect(conn, false);
-    g_conn = conn; g_busType = type;
-        // Start pump thread if not running
-    if (!g_running.exchange(true)) {
-        if (g_pumpThread.joinable()) {
-            g_pumpThread.join();
-        }
-        g_pumpThread = std::thread([state] { pump_loop(state); });
-    }
-        if (g_debug) fprintf(stderr, "dbus: connected to %s bus\n", type == BusType::System ? "system" : "session");
-        // Notify all waiters of success
         std::vector<uint32_t> waiters;
         {
             std::lock_guard<std::mutex> lk(g_connectWaitersMutex);
             waiters.swap(g_connectWaiterIds);
+            g_connecting.store(false);
         }
-        if (!waiters.empty()) {
-            std::lock_guard<std::mutex> lk(g_replyMutex);
-            for (uint32_t wid : waiters) {
-                ReplyItem ri; ri.id = wid; ri.ok = true; ri.payload = std::string();
-                g_replies.push(std::move(ri));
-            }
+        std::lock_guard<std::mutex> lk(g_replyMutex);
+        for (uint32_t id : waiters) {
+            ReplyItem reply; reply.id = id; reply.ok = conn != nullptr; reply.payload = error;
+            g_replies.push(std::move(reply));
         }
-        g_connecting.store(false);
-        dbusState = nullptr;
     });
 
     return promise;
@@ -525,6 +501,7 @@ static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSVal
 
 // JS: addMatch(rule) — convenience wrapper for dbus_bus_add_match.
 static JSValue js_addMatch(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    if (!g_conn) return JS_ThrowInternalError(ctx, "bus is not connected; await connect() first");
     if (argc < 1) return JS_ThrowTypeError(ctx, "addMatch expects (string)");
     std::string rule = js_to_string(ctx, argv[0]);
     // Non-blocking AddMatch: send method call without waiting for a reply
@@ -551,9 +528,9 @@ static JSValue js_addMatch(JSContext* ctx, JSValueConst this_val, int argc, JSVa
 }
 
 // JS: call(dest, path, iface, method[, signature, ...args]) -> Promise<string>
-// Sends a method call; the pump thread pairs the next reply with the earliest
-// pending Promise (simple correlation for this minimal example).
+// Sends a method call and correlates the reply using its DBus serial.
 static JSValue js_call(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    if (!g_conn) return JS_ThrowInternalError(ctx, "bus is not connected; await connect() first");
     if (argc < 4) return JS_ThrowTypeError(ctx, "call expects (dest, path, iface, method[, signature, ...args])");
     std::string dest = js_to_string(ctx, argv[0]);
     std::string path = js_to_string(ctx, argv[1]);
@@ -944,6 +921,7 @@ static bool append_by_signature(DBusMessageIter* iter, const char** psig, JSCont
 }
 
 static JSValue js_callComplex(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    if (!g_conn) return JS_ThrowInternalError(ctx, "bus is not connected; await connect() first");
     if (argc < 5) return JS_ThrowTypeError(ctx, "callComplex expects (dest, path, iface, method, signature, ...args)");
     std::string dest = js_to_string(ctx, argv[0]);
     std::string path = js_to_string(ctx, argv[1]);
@@ -1073,28 +1051,31 @@ static void dbus_update(void*) {
                             JS_PROP_C_W_E
                         );
                     }
-                    JS_Call(g_ctx, pend.resolve, JS_UNDEFINED, 1, &arr);
+                    JSValue result = JS_Call(g_ctx, pend.resolve, JS_UNDEFINED, 1, &arr);
+                    JS_FreeValue(g_ctx, result);
                     JS_FreeValue(g_ctx, arr);
                 } else if (r.isJson) {
-                    JSValue jsonStr = JS_NewString(g_ctx, r.payload.c_str());
-                    JSValue global = JS_GetGlobalObject(g_ctx);
-                    JSValue jsonObj = JS_GetPropertyStr(g_ctx, global, "JSON");
-                    JSValue parseFn = JS_GetPropertyStr(g_ctx, jsonObj, "parse");
-                    JSValue parsed = JS_Call(g_ctx, parseFn, jsonObj, 1, &jsonStr);
-                    JS_FreeValue(g_ctx, parseFn);
-                    JS_FreeValue(g_ctx, jsonObj);
-                    JS_FreeValue(g_ctx, global);
-                    JS_FreeValue(g_ctx, jsonStr);
-                    JS_Call(g_ctx, pend.resolve, JS_UNDEFINED, 1, &parsed);
-                    JS_FreeValue(g_ctx, parsed);
+                    JSValue parsed = JS_ParseJSON(g_ctx, r.payload.data(), r.payload.size(), "<dbus-reply>");
+                    if (JS_IsException(parsed)) {
+                        JSValue error = JS_GetException(g_ctx);
+                        JSValue result = JS_Call(g_ctx, pend.reject, JS_UNDEFINED, 1, &error);
+                        JS_FreeValue(g_ctx, result);
+                        JS_FreeValue(g_ctx, error);
+                    } else {
+                        JSValue result = JS_Call(g_ctx, pend.resolve, JS_UNDEFINED, 1, &parsed);
+                        JS_FreeValue(g_ctx, result);
+                        JS_FreeValue(g_ctx, parsed);
+                    }
                 } else {
                     JSValue s = JS_NewString(g_ctx, r.payload.c_str());
-                    JS_Call(g_ctx, pend.resolve, JS_UNDEFINED, 1, &s);
+                    JSValue result = JS_Call(g_ctx, pend.resolve, JS_UNDEFINED, 1, &s);
+                    JS_FreeValue(g_ctx, result);
                     JS_FreeValue(g_ctx, s);
                 }
             } else {
                 JSValue s = JS_NewString(g_ctx, r.payload.c_str());
-                JS_Call(g_ctx, pend.reject, JS_UNDEFINED, 1, &s);
+                JSValue result = JS_Call(g_ctx, pend.reject, JS_UNDEFINED, 1, &s);
+                JS_FreeValue(g_ctx, result);
                 JS_FreeValue(g_ctx, s);
             }
             JS_FreeValue(g_ctx, pend.resolve);
@@ -1111,7 +1092,7 @@ static void dbus_update(void*) {
         std::vector<JSValue> cbs;
         {
             std::lock_guard<std::mutex> lk(g_cbMutex);
-            cbs = g_signalCallbacks; // copy
+            for (auto cb : g_signalCallbacks) cbs.push_back(JS_DupValue(g_ctx, cb));
         }
         for (auto& s : sigs) {
             JSValue obj = JS_NewObject(g_ctx);
@@ -1121,6 +1102,13 @@ static void dbus_update(void*) {
             JS_SetPropertyStr(g_ctx, obj, "member", JS_NewString(g_ctx, s.member.c_str()));
             JS_SetPropertyStr(g_ctx, obj, "signature", JS_NewString(g_ctx, s.signature.c_str()));
             JS_SetPropertyStr(g_ctx, obj, "body", JS_NewString(g_ctx, s.body.c_str()));
+            JSValue args = JS_ParseJSON(g_ctx, s.argsJson.data(), s.argsJson.size(), "<dbus-signal>");
+            if (JS_IsException(args)) {
+                JS_FreeValue(g_ctx, JS_GetException(g_ctx));
+                JS_FreeValue(g_ctx, obj);
+                continue;
+            }
+            JS_SetPropertyStr(g_ctx, obj, "args", args);
             for (auto& cb : cbs) {
                 JSValue arg = JS_DupValue(g_ctx, obj);
                 JSValue unused = JS_Call(g_ctx, cb, JS_UNDEFINED, 1, &arg);
@@ -1136,11 +1124,12 @@ static void dbus_update(void*) {
             }
             JS_FreeValue(g_ctx, obj);
         }
+        for (auto cb : cbs) JS_FreeValue(g_ctx, cb);
     }
 }
 
 static void dbus_shutdown(DbusState* state) {
-    dbusState = state;
+    StateScope scope(state);
     state->shuttingDown.store(true);
     g_connecting.store(false);
     if (g_connectThread.joinable()) g_connectThread.join();
@@ -1176,21 +1165,59 @@ static void dbus_shutdown(DbusState* state) {
         g_serialToPromiseId.clear();
     }
     if (g_conn) {
+        dbus_connection_close(g_conn);
         dbus_connection_unref(g_conn);
         g_conn = nullptr;
     }
     g_ctx = nullptr;
-    dbusState = nullptr;
 }
 
-// Module init — binds native functions as JS module exports.
+// Every exported function captures its connection state, so detached methods
+// and calls from another JS runtime never depend on whichever update ran last.
+struct Binding {
+    const char* name;
+    JSCFunction* function;
+    int length;
+};
+static const Binding bindings[] = {
+    {"connect", js_connect, 1}, {"addMatch", js_addMatch, 1},
+    {"call", js_call, 5}, {"callComplex", js_callComplex, 6},
+    {"onSignal", js_onSignal, 1}, {"offSignal", js_offSignal, 1}
+};
+
+static JSValue bound_call(JSContext* ctx, JSValueConst this_val, int argc,
+                          JSValueConst* argv, int magic, JSValue* data) {
+    int64_t pointer = 0;
+    if (JS_ToBigInt64(ctx, &pointer, data[0]) < 0) return JS_EXCEPTION;
+    auto* state = reinterpret_cast<DbusState*>(static_cast<intptr_t>(pointer));
+    StateScope scope(state);
+    if (!state->context || state->shuttingDown.load()) return JS_ThrowInternalError(ctx, "bus is shut down");
+    // The explicit handles always connect to their own bus.
+    if (magic == 0 && JS_ToBool(ctx, data[1])) return js_connect(ctx, this_val, 0, nullptr);
+    return bindings[magic].function(ctx, this_val, argc, argv);
+}
+
+static JSValue make_function(JSContext* ctx, DbusState* state, int index, bool fixedBus) {
+    JSValue data[] = {JS_NewBigInt64(ctx, static_cast<int64_t>(reinterpret_cast<intptr_t>(state))), JS_NewBool(ctx, fixedBus)};
+    JSValue fn = JS_NewCFunctionData(ctx, bound_call, bindings[index].length, index, 2, data);
+    for (auto value : data) JS_FreeValue(ctx, value);
+    return fn;
+}
+
+static JSValue make_bus_handle(JSContext* ctx, DbusState* state) {
+    JSValue handle = JS_NewObject(ctx);
+    for (int i = 0; i < 6; ++i) JS_SetPropertyStr(ctx, handle, bindings[i].name, make_function(ctx, state, i, true));
+    return handle;
+}
+
 static int dbus_module_init(JSContext* ctx, JSModuleDef* m) {
-    JS_SetModuleExport(ctx, m, "connect", JS_NewCFunction(ctx, js_connect, "connect", 1));
-    JS_SetModuleExport(ctx, m, "addMatch", JS_NewCFunction(ctx, js_addMatch, "addMatch", 1));
-    JS_SetModuleExport(ctx, m, "call", JS_NewCFunction(ctx, js_call, "call", 5));
-    JS_SetModuleExport(ctx, m, "callComplex", JS_NewCFunction(ctx, js_callComplex, "callComplex", 6));
-    JS_SetModuleExport(ctx, m, "onSignal", JS_NewCFunction(ctx, js_onSignal, "onSignal", 1));
-    JS_SetModuleExport(ctx, m, "offSignal", JS_NewCFunction(ctx, js_offSignal, "offSignal", 1));
+    std::lock_guard<std::mutex> lock(pluginOwnersMutex);
+    auto it = pluginOwners.find(ctx);
+    if (it == pluginOwners.end()) return -1;
+    auto* owner = it->second;
+    for (int i = 0; i < 6; ++i) JS_SetModuleExport(ctx, m, bindings[i].name, make_function(ctx, &owner->runtime, i, false));
+    JS_SetModuleExport(ctx, m, "session", make_bus_handle(ctx, &owner->session));
+    JS_SetModuleExport(ctx, m, "system", make_bus_handle(ctx, &owner->system));
     return 0;
 }
 
@@ -1199,23 +1226,32 @@ HELIX_PLUGIN_EXPORT int helix_plugin_integrate(JSContext* ctx, const char* modul
     if (!out) return 1;
     auto* owner = new DbusPlugin();
     if (!owner->initialize(host)) { delete owner; return 1; }
-    dbusState = &owner->runtime;
-    g_ctx = ctx;
+    owner->runtime.context = owner->session.context = owner->system.context = ctx;
+    owner->system.busType = BusType::System;
+    {
+        std::lock_guard<std::mutex> lock(pluginOwnersMutex);
+        pluginOwners.emplace(ctx, owner);
+    }
     owner->instance.scriptUpdate = [](void* state, const HelixPluginUpdate*) {
-        dbusState = &static_cast<DbusPlugin*>(state)->runtime;
-        dbus_update(nullptr);
+        auto* plugin = static_cast<DbusPlugin*>(state);
+        for (auto* bus : {&plugin->runtime, &plugin->session, &plugin->system}) {
+            StateScope scope(bus);
+            dbus_update(nullptr);
+        }
     };
     owner->instance.scriptShutdown = [](void* state){
-        dbus_shutdown(&static_cast<DbusPlugin*>(state)->runtime);
+        auto* plugin = static_cast<DbusPlugin*>(state);
+        {
+            std::lock_guard<std::mutex> lock(pluginOwnersMutex);
+            pluginOwners.erase(plugin->runtime.context);
+        }
+        for (auto* bus : {&plugin->runtime, &plugin->session, &plugin->system}) dbus_shutdown(bus);
     };
     JSModuleDef* m = JS_NewCModule(ctx, module_name, dbus_module_init);
-    if (!m) { dbus_shutdown(&owner->runtime); delete owner; return 1; }
-    JS_AddModuleExport(ctx, m, "connect");
-    JS_AddModuleExport(ctx, m, "addMatch");
-    JS_AddModuleExport(ctx, m, "call");
-    JS_AddModuleExport(ctx, m, "callComplex");
-    JS_AddModuleExport(ctx, m, "onSignal");
-    JS_AddModuleExport(ctx, m, "offSignal");
+    if (!m) { owner->instance.scriptShutdown(owner); delete owner; return 1; }
+    for (const auto& binding : bindings) JS_AddModuleExport(ctx, m, binding.name);
+    JS_AddModuleExport(ctx, m, "session");
+    JS_AddModuleExport(ctx, m, "system");
     owner->instance.abiVersion = HELIX_PLUGIN_ABI_VERSION;
     owner->instance.module = m;
     owner->instance.state = owner;

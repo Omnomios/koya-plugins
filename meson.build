@@ -61,6 +61,22 @@ if 'dbus' in plugin_selection
   )
   plugin_test_names += ['dbus']
   plugin_test_targets += [dbus_plugin]
+  # The standalone test harness needs matching QuickJS symbols of its own.
+  if quickjs_library != '' and not meson.is_cross_build()
+    dbus_regression = executable(
+      'helix_dbus_regression',
+      files('tests/dbus_regression.cpp'),
+      link_with: dbus_plugin,
+      include_directories: plugin_inc,
+      dependencies: plugin_common_deps + [dbus_dep, cpp.find_library('m')],
+    )
+    test(
+      'hx-dbus-regression',
+      find_program('python3'),
+      args: [files('tests/run_dbus_regression.py'), find_program('dbus-daemon').full_path(), dbus_regression],
+      timeout: 40,
+    )
+  endif
 endif
 
 if 'ffmpeg' in plugin_selection

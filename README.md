@@ -88,6 +88,9 @@ try {
 
 The engine drives asynchronous completions and callbacks on its script thread.
 
+For independent session/system D-Bus connections, typed signal arguments, and
+regression test instructions, see the [D-Bus API guide](docs/dbus.md).
+
 ## Write your own native plugin
 
 Start with the [SQLite implementation](sqlite/src/module.cpp) for a compact
