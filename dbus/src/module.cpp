@@ -2,7 +2,7 @@
    Koya Plugin: DBus
 
    What this is:
-   - Application code that exposes a small, pragmatic DBus client to the Koya
+   - Application code that exposes a small, pragmatic DBus interface to the Koya
      JavaScript runtime (QuickJS).
 
    Koya vs Application responsibilities:
@@ -17,6 +17,8 @@
        - addMatch(rule)
        - call(dest, path, iface, method[, signature, ...args]) -> Promise<string>
        - onSignal(cb), offSignal(cb?)
+       - exportObject(path, iface, handler), unexportObject(path, iface)
+       - emitSignal(path, iface, member, signature, ...args)
        - session / system: independent handles with the same methods
 
    Integration points you can copy for your own plugins:
@@ -88,6 +90,11 @@ struct SignalItem {
 };
 
 struct DbusState {
+    std::mutex methodMutex;
+    std::queue<DBusMessage*> methods;
+    std::unordered_map<std::string, JSValue> exports;
+    std::unordered_map<uint32_t, DBusMessage*> invocations;
+    uint32_t nextInvocation = 1;
     std::atomic<uint32_t> nextId{1};
     std::mutex promiseMutex;
     std::unordered_map<uint32_t, PendingPromise> promises;
@@ -111,6 +118,7 @@ struct DbusState {
     std::vector<uint32_t> connectWaiterIds;
     std::mutex busIoMutex;
     bool debug = false;
+    std::vector<std::string> matchRules;
 };
 
 static std::once_flag dbusThreadsOnce;
@@ -311,6 +319,11 @@ static ReplyItem decode_reply(DBusMessage* msg, uint32_t id) {
     if (!reply.ok) {
         const char* name = dbus_message_get_error_name(msg);
         reply.payload = std::string("ERROR:") + (name ? name : "unknown");
+        DBusMessageIter detail;
+        if (dbus_message_iter_init(msg, &detail) && dbus_message_iter_get_arg_type(&detail) == DBUS_TYPE_STRING) {
+            const char *message = nullptr; dbus_message_iter_get_basic(&detail, &message);
+            if (message && *message) reply.payload += std::string(": ") + message;
+        }
         return reply;
     }
     DBusMessageIter iter;
@@ -394,6 +407,9 @@ static void pump_loop(DbusState* state) {
                     std::lock_guard<std::mutex> lk(g_replyMutex);
                     g_replies.push(std::move(reply));
                 }
+            } else if (type == DBUS_MESSAGE_TYPE_METHOD_CALL) {
+                std::lock_guard<std::mutex> lk(state->methodMutex);
+                state->methods.push(dbus_message_ref(msg));
             } else if (type == DBUS_MESSAGE_TYPE_SIGNAL) {
                 SignalItem signal = decode_signal(msg);
                 std::lock_guard<std::mutex> lk(g_sigMutex);
@@ -401,6 +417,7 @@ static void pump_loop(DbusState* state) {
             }
             dbus_message_unref(msg);
         }
+        if (!dbus_connection_get_is_connected(conn)) { g_running.store(false); break; }
     }
 }
 
@@ -416,6 +433,23 @@ static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSVal
     }
     if ((g_conn != nullptr || g_connecting.load()) && type != g_busType) {
         return JS_ThrowTypeError(ctx, "already using another bus; use the session and system handles");
+    }
+    if (g_conn && !dbus_connection_get_is_connected(g_conn)) {
+        g_running.store(false);
+        if (g_connectThread.joinable()) g_connectThread.join();
+        if (g_pumpThread.joinable()) g_pumpThread.join();
+        dbus_connection_unref(g_conn); g_conn = nullptr;
+        { std::lock_guard<std::mutex> lock(g_serialMapMutex); g_serialToPromiseId.clear(); }
+        { std::lock_guard<std::mutex> lock(g_promMutex);
+          std::lock_guard<std::mutex> replies(g_replyMutex);
+          for (const auto &entry : g_promises) {
+              ReplyItem reply; reply.id = entry.first; reply.ok = false; reply.payload = "ERROR:disconnected";
+              g_replies.push(std::move(reply));
+          } }
+        for (auto &entry : dbusState->invocations) dbus_message_unref(entry.second);
+        dbusState->invocations.clear();
+        { std::lock_guard<std::mutex> lock(dbusState->methodMutex);
+          while (!dbusState->methods.empty()) { dbus_message_unref(dbusState->methods.front()); dbusState->methods.pop(); } }
     }
     if (g_conn != nullptr) {
         JSValue funcs[2];
@@ -476,6 +510,7 @@ static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSVal
             return;
         } else {
             dbus_connection_set_exit_on_disconnect(conn, false);
+            for (const auto &rule : state->matchRules) dbus_bus_add_match(conn, rule.c_str(), nullptr);
             g_conn = conn;
             if (!g_running.exchange(true)) {
                 if (g_pumpThread.joinable()) g_pumpThread.join();
@@ -501,7 +536,7 @@ static JSValue js_connect(JSContext* ctx, JSValueConst this_val, int argc, JSVal
 
 // JS: addMatch(rule) — convenience wrapper for dbus_bus_add_match.
 static JSValue js_addMatch(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    if (!g_conn) return JS_ThrowInternalError(ctx, "bus is not connected; await connect() first");
+    if (!g_conn || !dbus_connection_get_is_connected(g_conn)) return JS_ThrowInternalError(ctx, "bus is not connected; await connect() first");
     if (argc < 1) return JS_ThrowTypeError(ctx, "addMatch expects (string)");
     std::string rule = js_to_string(ctx, argv[0]);
     // Non-blocking AddMatch: send method call without waiting for a reply
@@ -523,6 +558,9 @@ static JSValue js_addMatch(JSContext* ctx, JSValueConst this_val, int argc, JSVa
     dbus_connection_flush(g_conn);
     }
     dbus_message_unref(msg);
+    bool remembered = false;
+    for (const auto &existing : dbusState->matchRules) if (existing == rule) remembered = true;
+    if (!remembered) dbusState->matchRules.push_back(rule);
     if (g_debug) fprintf(stderr, "dbus addMatch: %s\n", rule.c_str());
     return JS_UNDEFINED;
 }
@@ -659,266 +697,7 @@ static JSValue js_call(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
 // Supports signatures containing a{sv}, a{sa{sv}}, v, ay, as, and basic types.
 // For variant contents, types are inferred from JS values. To force a type, pass
 // an object { _t: 'TYPE', _v: VALUE } where TYPE in { 's','b','i','u','ay','as' }.
-static bool append_basic_typed(DBusMessageIter* iter, char t, JSContext* ctx, JSValueConst v) {
-    switch (t) {
-        case 's': {
-            const char* s = JS_ToCString(ctx, v);
-            bool ok = dbus_message_iter_append_basic(iter, DBUS_TYPE_STRING, &s);
-            if (s) JS_FreeCString(ctx, s);
-            return ok;
-        }
-        case 'o': {
-            const char* s = JS_ToCString(ctx, v);
-            bool ok = dbus_message_iter_append_basic(iter, DBUS_TYPE_OBJECT_PATH, &s);
-            if (s) JS_FreeCString(ctx, s);
-            return ok;
-        }
-        case 'b': {
-            int b = JS_ToBool(ctx, v);
-            dbus_bool_t bv = b ? 1 : 0;
-            return dbus_message_iter_append_basic(iter, DBUS_TYPE_BOOLEAN, &bv);
-        }
-        case 'i': {
-            int32_t iv = 0; JS_ToInt32(ctx, &iv, v);
-            return dbus_message_iter_append_basic(iter, DBUS_TYPE_INT32, &iv);
-        }
-        case 'u': {
-            int64_t tmp = 0; JS_ToInt64(ctx, &tmp, v); uint32_t uv = (uint32_t)tmp;
-            return dbus_message_iter_append_basic(iter, DBUS_TYPE_UINT32, &uv);
-        }
-        case 'y': {
-            int64_t tmp = 0; JS_ToInt64(ctx, &tmp, v); uint8_t bv = (uint8_t)tmp;
-            return dbus_message_iter_append_basic(iter, DBUS_TYPE_BYTE, &bv);
-        }
-        default:
-            return false;
-    }
-}
-
-static bool infer_and_append_array(DBusMessageIter* iter, JSContext* ctx, JSValueConst arr) {
-    // Determine if array is of strings (as) or bytes (ay)
-    uint32_t len = 0;
-    JSValue lenv = JS_GetPropertyStr(ctx, arr, "length");
-    JS_ToUint32(ctx, &len, lenv); JS_FreeValue(ctx, lenv);
-    bool allString = true, allByte = len > 0;
-    for (uint32_t i = 0; i < len; ++i) {
-        JSValue iv = JS_GetPropertyUint32(ctx, arr, i);
-        if (!JS_IsString(iv)) allString = false;
-        if (!JS_IsNumber(iv)) allByte = false;
-        JS_FreeValue(ctx, iv);
-    }
-    if (allByte) {
-        DBusMessageIter sub; dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY, "y", &sub);
-        for (uint32_t i = 0; i < len; ++i) {
-            JSValue iv = JS_GetPropertyUint32(ctx, arr, i);
-            int64_t tmp = 0; JS_ToInt64(ctx, &tmp, iv); JS_FreeValue(ctx, iv);
-            uint8_t b = (uint8_t)(tmp & 0xFF);
-            if (!dbus_message_iter_append_basic(&sub, DBUS_TYPE_BYTE, &b)) { dbus_message_iter_close_container(iter, &sub); return false; }
-        }
-        dbus_message_iter_close_container(iter, &sub);
-        return true;
-    }
-    if (allString || len == 0) {
-        DBusMessageIter sub; dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY, "s", &sub);
-        for (uint32_t i = 0; i < len; ++i) {
-            JSValue iv = JS_GetPropertyUint32(ctx, arr, i);
-            const char* s = JS_ToCString(ctx, iv); JS_FreeValue(ctx, iv);
-            if (!dbus_message_iter_append_basic(&sub, DBUS_TYPE_STRING, &s)) { if (s) JS_FreeCString(ctx, s); dbus_message_iter_close_container(iter, &sub); return false; }
-            if (s) JS_FreeCString(ctx, s);
-        }
-        dbus_message_iter_close_container(iter, &sub);
-        return true;
-    }
-    return false;
-}
-
-static bool append_variant(DBusMessageIter* iter, JSContext* ctx, JSValueConst v) {
-    // Check for explicit type wrapper: { _t: 'ay', _v: [...] } or { t: 'ay', v: [...] }
-    JSValue tv = JS_GetPropertyStr(ctx, v, "_t");
-    if (!JS_IsString(tv)) { JS_FreeValue(ctx, tv); tv = JS_GetPropertyStr(ctx, v, "t"); }
-    if (JS_IsString(tv)) {
-        std::string t = js_to_string(ctx, tv);
-        JS_FreeValue(ctx, tv);
-        JSValue vv = JS_GetPropertyStr(ctx, v, "_v");
-        if (JS_IsUndefined(vv)) { JS_FreeValue(ctx, vv); vv = JS_GetPropertyStr(ctx, v, "v"); }
-        bool ok = false;
-        if (t == "ay") {
-            DBusMessageIter var; dbus_message_iter_open_container(iter, DBUS_TYPE_VARIANT, "ay", &var);
-            ok = infer_and_append_array(&var, ctx, vv);
-            dbus_message_iter_close_container(iter, &var);
-        } else if (t == "as") {
-            DBusMessageIter var; dbus_message_iter_open_container(iter, DBUS_TYPE_VARIANT, "as", &var);
-            ok = infer_and_append_array(&var, ctx, vv);
-            dbus_message_iter_close_container(iter, &var);
-        } else if (t == "s" || t == "b" || t == "i" || t == "u") {
-            DBusMessageIter var; dbus_message_iter_open_container(iter, DBUS_TYPE_VARIANT, t.c_str(), &var);
-            ok = append_basic_typed(&var, t[0], ctx, vv);
-            dbus_message_iter_close_container(iter, &var);
-        }
-        JS_FreeValue(ctx, vv);
-        return ok;
-    }
-    JS_FreeValue(ctx, tv);
-    // Infer type
-    if (JS_IsString(v)) {
-        DBusMessageIter var; dbus_message_iter_open_container(iter, DBUS_TYPE_VARIANT, "s", &var);
-        bool ok = append_basic_typed(&var, 's', ctx, v);
-        dbus_message_iter_close_container(iter, &var);
-        return ok;
-    }
-    if (JS_IsBool(v)) {
-        DBusMessageIter var; dbus_message_iter_open_container(iter, DBUS_TYPE_VARIANT, "b", &var);
-        bool ok = append_basic_typed(&var, 'b', ctx, v);
-        dbus_message_iter_close_container(iter, &var);
-        return ok;
-    }
-    if (JS_IsNumber(v)) {
-        // int32 by default
-        DBusMessageIter var; dbus_message_iter_open_container(iter, DBUS_TYPE_VARIANT, "i", &var);
-        bool ok = append_basic_typed(&var, 'i', ctx, v);
-        dbus_message_iter_close_container(iter, &var);
-        return ok;
-    }
-    if (JS_IsArray(ctx, v)) {
-        // Choose ay if all numeric, else as
-        // We'll compute in infer_and_append_array
-        // First check numeric or string by scanning
-        uint32_t len = 0; JSValue lenv = JS_GetPropertyStr(ctx, v, "length"); JS_ToUint32(ctx, &len, lenv); JS_FreeValue(ctx, lenv);
-        bool allByte = len > 0, allString = true;
-        for (uint32_t i = 0; i < len; ++i) { JSValue iv = JS_GetPropertyUint32(ctx, v, i); if (!JS_IsNumber(iv)) allByte = false; if (!JS_IsString(iv)) allString = false; JS_FreeValue(ctx, iv); }
-        const char* sig = allByte ? "ay" : "as";
-        DBusMessageIter var; dbus_message_iter_open_container(iter, DBUS_TYPE_VARIANT, sig, &var);
-        bool ok = infer_and_append_array(&var, ctx, v);
-        dbus_message_iter_close_container(iter, &var);
-        return ok;
-    }
-    // Fallback to string
-    DBusMessageIter var; dbus_message_iter_open_container(iter, DBUS_TYPE_VARIANT, "s", &var);
-    JSValue s = JS_ToString(ctx, v);
-    bool ok = append_basic_typed(&var, 's', ctx, s);
-    JS_FreeValue(ctx, s);
-    dbus_message_iter_close_container(iter, &var);
-    return ok;
-}
-
-static bool append_a_sv(DBusMessageIter* iter, JSContext* ctx, JSValueConst obj) {
-    DBusMessageIter arr; dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY, "{sv}", &arr);
-    JSPropertyEnum* props = nullptr; uint32_t plen = 0;
-    if (JS_GetOwnPropertyNames(ctx, &props, &plen, obj, JS_GPN_ENUM_ONLY | JS_GPN_STRING_MASK) < 0) {
-        dbus_message_iter_close_container(iter, &arr); return false;
-    }
-    for (uint32_t i = 0; i < plen; ++i) {
-        JSAtom atom = props[i].atom;
-        JSValue keyv = JS_AtomToString(ctx, atom);
-        const char* key = JS_ToCString(ctx, keyv);
-        JSValue val = JS_GetProperty(ctx, obj, atom);
-        DBusMessageIter dict; dbus_message_iter_open_container(&arr, DBUS_TYPE_DICT_ENTRY, nullptr, &dict);
-        dbus_message_iter_append_basic(&dict, DBUS_TYPE_STRING, &key);
-        if (!append_variant(&dict, ctx, val)) { JS_FreeValue(ctx, val); if (key) JS_FreeCString(ctx, key); JS_FreeValue(ctx, keyv); dbus_message_iter_close_container(&arr, &dict); js_free(ctx, props); dbus_message_iter_close_container(iter, &arr); return false; }
-        dbus_message_iter_close_container(&arr, &dict);
-        JS_FreeValue(ctx, val);
-        if (key) JS_FreeCString(ctx, key);
-        JS_FreeValue(ctx, keyv);
-        JS_FreeAtom(ctx, atom);
-    }
-    if (props) js_free(ctx, props);
-    dbus_message_iter_close_container(iter, &arr);
-    return true;
-}
-
-static bool append_a_s_a_sv(DBusMessageIter* iter, JSContext* ctx, JSValueConst obj) {
-    DBusMessageIter arr; dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY, "{sa{sv}}", &arr);
-    JSPropertyEnum* props = nullptr; uint32_t plen = 0;
-    if (JS_GetOwnPropertyNames(ctx, &props, &plen, obj, JS_GPN_ENUM_ONLY | JS_GPN_STRING_MASK) < 0) {
-        dbus_message_iter_close_container(iter, &arr); return false;
-    }
-    for (uint32_t i = 0; i < plen; ++i) {
-        JSAtom atom = props[i].atom;
-        JSValue keyv = JS_AtomToString(ctx, atom);
-        const char* section = JS_ToCString(ctx, keyv);
-        JSValue inner = JS_GetProperty(ctx, obj, atom);
-        DBusMessageIter dict; dbus_message_iter_open_container(&arr, DBUS_TYPE_DICT_ENTRY, nullptr, &dict);
-        dbus_message_iter_append_basic(&dict, DBUS_TYPE_STRING, &section);
-        // value is a{sv}
-        DBusMessageIter innerArr; dbus_message_iter_open_container(&dict, DBUS_TYPE_ARRAY, "{sv}", &innerArr);
-        // Reuse append_a_sv logic by writing directly into innerArr
-        // But append_a_sv expects to open/close the array; so inline here
-        JSPropertyEnum* iprops = nullptr; uint32_t ilen = 0;
-        if (JS_GetOwnPropertyNames(ctx, &iprops, &ilen, inner, JS_GPN_ENUM_ONLY | JS_GPN_STRING_MASK) < 0) { if (section) JS_FreeCString(ctx, section); JS_FreeValue(ctx, keyv); JS_FreeAtom(ctx, atom); js_free(ctx, props); dbus_message_iter_close_container(&dict, &innerArr); dbus_message_iter_close_container(&arr, &dict); dbus_message_iter_close_container(iter, &arr); return false; }
-        for (uint32_t j = 0; j < ilen; ++j) {
-            JSAtom ikeyAtom = iprops[j].atom;
-            JSValue ikeyv = JS_AtomToString(ctx, ikeyAtom);
-            const char* ikey = JS_ToCString(ctx, ikeyv);
-            JSValue ival = JS_GetProperty(ctx, inner, ikeyAtom);
-            DBusMessageIter idict; dbus_message_iter_open_container(&innerArr, DBUS_TYPE_DICT_ENTRY, nullptr, &idict);
-            dbus_message_iter_append_basic(&idict, DBUS_TYPE_STRING, &ikey);
-            if (!append_variant(&idict, ctx, ival)) { JS_FreeValue(ctx, ival); if (ikey) JS_FreeCString(ctx, ikey); JS_FreeValue(ctx, ikeyv); JS_FreeAtom(ctx, ikeyAtom); js_free(ctx, iprops); if (section) JS_FreeCString(ctx, section); JS_FreeValue(ctx, keyv); JS_FreeAtom(ctx, atom); dbus_message_iter_close_container(&innerArr, &idict); dbus_message_iter_close_container(&dict, &innerArr); dbus_message_iter_close_container(&arr, &dict); dbus_message_iter_close_container(iter, &arr); return false; }
-            dbus_message_iter_close_container(&innerArr, &idict);
-            JS_FreeValue(ctx, ival);
-            if (ikey) JS_FreeCString(ctx, ikey);
-            JS_FreeValue(ctx, ikeyv);
-            JS_FreeAtom(ctx, ikeyAtom);
-        }
-        if (iprops) js_free(ctx, iprops);
-        dbus_message_iter_close_container(&dict, &innerArr);
-        dbus_message_iter_close_container(&arr, &dict);
-        JS_FreeValue(ctx, inner);
-        if (section) JS_FreeCString(ctx, section);
-        JS_FreeValue(ctx, keyv);
-        JS_FreeAtom(ctx, atom);
-    }
-    if (props) js_free(ctx, props);
-    dbus_message_iter_close_container(iter, &arr);
-    return true;
-}
-
-static bool append_by_signature(DBusMessageIter* iter, const char** psig, JSContext* ctx, JSValueConst v) {
-    const char* sig = *psig;
-    if (!sig || *sig == '\0') return false;
-    char t = *sig;
-    if (t == 'a') {
-        ++sig;
-        if (*sig == '{') {
-            ++sig;
-            // Expect sv or sa{sv}
-            if (*sig == 's') {
-                ++sig;
-                if (*sig == 'v') {
-                    // a{sv}
-                    ++sig; if (*sig != '}') return false; ++sig; // skip '}'
-                    bool ok = append_a_sv(iter, ctx, v);
-                    *psig = sig; return ok;
-                } else if (*sig == 'a') {
-                    ++sig; if (*sig != '{') return false; ++sig;
-                    if (*sig != 's') return false; ++sig;
-                    if (*sig != 'v') return false; ++sig;
-                    if (*sig != '}') return false; ++sig; // end inner {sv}
-                    if (*sig != '}') return false; ++sig; // end outer {sa{sv}}
-                    bool ok = append_a_s_a_sv(iter, ctx, v);
-                    *psig = sig; return ok;
-                } else {
-                    return false;
-                }
-            }
-            return false;
-        } else if (*sig == 'y' || *sig == 's') {
-            // arrays of basic types via inference
-            const char arrSig[2] = { *sig, 0 };
-            DBusMessageIter sub; dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY, arrSig, &sub);
-            bool ok = infer_and_append_array(&sub, ctx, v);
-            dbus_message_iter_close_container(iter, &sub);
-            ++sig; *psig = sig; return ok;
-        } else {
-            return false;
-        }
-    }
-    if (t == 'v') {
-        ++sig; *psig = sig; return append_variant(iter, ctx, v);
-    }
-    // Basic types
-    bool ok = append_basic_typed(iter, t, ctx, v);
-    ++sig; *psig = sig; return ok;
-}
+#include "marshal.hpp"
 
 static JSValue js_callComplex(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     if (!g_conn) return JS_ThrowInternalError(ctx, "bus is not connected; await connect() first");
@@ -932,12 +711,9 @@ static JSValue js_callComplex(JSContext* ctx, JSValueConst this_val, int argc, J
     DBusMessage* msg = dbus_message_new_method_call(dest.c_str(), path.c_str(), iface.c_str(), method.c_str());
     if (!msg) return JS_ThrowInternalError(ctx, "failed to allocate message");
     DBusMessageIter iter; dbus_message_iter_init_append(msg, &iter);
-    const char* psig = sig.c_str();
-    int argi = 5; // start of JS args
-    // Append each top-level arg according to signature
-    while (*psig) {
-        if (argi >= argc) { dbus_message_unref(msg); return JS_ThrowTypeError(ctx, "callComplex: missing JS arguments for signature"); }
-        if (!append_by_signature(&iter, &psig, ctx, argv[argi++])) { dbus_message_unref(msg); return JS_ThrowInternalError(ctx, "callComplex: failed to append arg"); }
+    if (!append_values(&iter, sig, ctx, argc - 5, argv + 5)) {
+        dbus_message_unref(msg);
+        return JS_ThrowTypeError(ctx, "callComplex arguments do not match signature");
     }
 
     // Create promise and send
@@ -967,6 +743,8 @@ static JSValue js_callComplex(JSContext* ctx, JSValueConst this_val, int argc, J
     dbus_message_unref(msg);
     return promise;
 }
+
+#include "service.hpp"
 
 // JS: onSignal(cb) — registers a callback to receive signal objects.
 static JSValue js_onSignal(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
@@ -1000,6 +778,7 @@ static JSValue js_offSignal(JSContext* ctx, JSValueConst this_val, int argc, JSV
 // signals to JS by resolving Promises and calling registered handlers.
 static void dbus_update(void*) {
     if (!g_ctx) return;
+    service_update();
     // 0) timeouts: synthesize replies for expired promises
     std::vector<ReplyItem> timedOut;
     {
@@ -1169,6 +948,14 @@ static void dbus_shutdown(DbusState* state) {
         dbus_connection_unref(g_conn);
         g_conn = nullptr;
     }
+    for (auto& entry : state->exports) JS_FreeValue(g_ctx, entry.second);
+    state->exports.clear();
+    for (auto& entry : state->invocations) dbus_message_unref(entry.second);
+    state->invocations.clear();
+    {
+        std::lock_guard<std::mutex> lock(state->methodMutex);
+        while (!state->methods.empty()) { dbus_message_unref(state->methods.front()); state->methods.pop(); }
+    }
     g_ctx = nullptr;
 }
 
@@ -1182,7 +969,9 @@ struct Binding {
 static const Binding bindings[] = {
     {"connect", js_connect, 1}, {"addMatch", js_addMatch, 1},
     {"call", js_call, 5}, {"callComplex", js_callComplex, 6},
-    {"onSignal", js_onSignal, 1}, {"offSignal", js_offSignal, 1}
+    {"onSignal", js_onSignal, 1}, {"offSignal", js_offSignal, 1},
+    {"exportObject", js_exportObject, 3}, {"unexportObject", js_unexportObject, 2},
+    {"emitSignal", js_emitSignal, 4}, {"emitSignalTo", js_emitSignalTo, 5}
 };
 
 static JSValue bound_call(JSContext* ctx, JSValueConst this_val, int argc,
@@ -1206,7 +995,7 @@ static JSValue make_function(JSContext* ctx, DbusState* state, int index, bool f
 
 static JSValue make_bus_handle(JSContext* ctx, DbusState* state) {
     JSValue handle = JS_NewObject(ctx);
-    for (int i = 0; i < 6; ++i) JS_SetPropertyStr(ctx, handle, bindings[i].name, make_function(ctx, state, i, true));
+    for (int i = 0; i < static_cast<int>(sizeof(bindings) / sizeof(bindings[0])); ++i) JS_SetPropertyStr(ctx, handle, bindings[i].name, make_function(ctx, state, i, true));
     return handle;
 }
 
@@ -1215,7 +1004,7 @@ static int dbus_module_init(JSContext* ctx, JSModuleDef* m) {
     auto it = pluginOwners.find(ctx);
     if (it == pluginOwners.end()) return -1;
     auto* owner = it->second;
-    for (int i = 0; i < 6; ++i) JS_SetModuleExport(ctx, m, bindings[i].name, make_function(ctx, &owner->runtime, i, false));
+    for (int i = 0; i < static_cast<int>(sizeof(bindings) / sizeof(bindings[0])); ++i) JS_SetModuleExport(ctx, m, bindings[i].name, make_function(ctx, &owner->runtime, i, false));
     JS_SetModuleExport(ctx, m, "session", make_bus_handle(ctx, &owner->session));
     JS_SetModuleExport(ctx, m, "system", make_bus_handle(ctx, &owner->system));
     return 0;

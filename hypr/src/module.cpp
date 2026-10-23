@@ -43,6 +43,8 @@
 #include <utility>
 #include <vector>
 
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -98,7 +100,7 @@ struct HyprState {
     std::unordered_map<uint32_t, PendingPromise> promises;
     std::mutex resultsMutex;
     std::queue<JobResult> results;
-    std::vector<std::thread> jobThreads;
+    std::map<uint32_t, std::thread> jobThreads;
     std::mutex activeSocketsMutex;
     std::vector<int> activeSockets;
 };
@@ -131,6 +133,7 @@ struct HyprPlugin : HelixPluginSupport {
 static int connect_unix(const std::string& path);
 
 static JSValue enqueue_job_promise(JSContext* ctx, JobType type, std::string cmd) {
+    if (g_promises.size() >= 64) return JS_ThrowInternalError(ctx, "Too many pending compositor requests");
     JSValue funcs[2];
     JSValue promise = JS_NewPromiseCapability(ctx, funcs);
     JSValue resolve = funcs[0];
@@ -143,7 +146,7 @@ static JSValue enqueue_job_promise(JSContext* ctx, JobType type, std::string cmd
     }
 
     HyprState* state = hyprState;
-    state->jobThreads.emplace_back([state, id, cmd = std::move(cmd)]() mutable {
+    state->jobThreads.emplace(id, std::thread([state, id, cmd = std::move(cmd)]() mutable {
         hyprState = state;
         int fd = connect_unix(g_sockCmdPath);
         bool ok = false;
@@ -154,15 +157,27 @@ static JSValue enqueue_job_promise(JSContext* ctx, JobType type, std::string cmd
                 if (!state->stopping.load()) state->activeSockets.push_back(fd);
             }
             if (!state->stopping.load()) {
+                timeval timeout{2, 0};
+                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+                setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
                 std::string line = cmd;
                 line.push_back('\0');
-                ::send(fd, line.data(), line.size(), 0);
-                char buf[65536];
-                ssize_t rn = ::recv(fd, buf, sizeof(buf) - 1, 0);
-                if (rn > 0) {
-                    buf[rn] = '\0';
-                    out.assign(buf);
-                    ok = true;
+                size_t sent = 0;
+                while (sent < line.size()) {
+                    ssize_t size = ::send(fd, line.data() + sent, line.size() - sent, MSG_NOSIGNAL);
+                    if (size < 0 && errno == EINTR) continue;
+                    if (size <= 0) break;
+                    sent += size;
+                }
+                if (sent == line.size()) {
+                    char buf[16384];
+                    for (;;) {
+                        ssize_t size = ::recv(fd, buf, sizeof buf, 0);
+                        if (size < 0 && errno == EINTR) continue;
+                        if (!size) { ok = !out.empty(); break; }
+                        if (size < 0 || out.size() + size > 4 * 1024 * 1024) break;
+                        out.append(buf, size);
+                    }
                 }
             }
             {
@@ -177,7 +192,7 @@ static JSValue enqueue_job_promise(JSContext* ctx, JobType type, std::string cmd
             g_results.push(JobResult{id, ok, std::move(out)});
         }
         hyprState = nullptr;
-    });
+    }));
 
     return promise;
 }
@@ -198,7 +213,7 @@ static std::string build_sock_path(const std::string& runtimeDir,
 }
 
 static int connect_unix(const std::string& path) {
-    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) return -1;
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -209,9 +224,14 @@ static int connect_unix(const std::string& path) {
     }
     std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
     if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd);
-        return -1;
+        if (errno != EINPROGRESS) { ::close(fd); return -1; }
+        pollfd pending{fd, POLLOUT, 0};
+        int error = 0; socklen_t size = sizeof error;
+        if (poll(&pending, 1, 2000) <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) < 0 || error) {
+            ::close(fd); return -1;
+        }
     }
+    if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK) < 0) { ::close(fd); return -1; }
     return fd;
 }
 
@@ -232,6 +252,7 @@ static std::optional<std::string> read_line(int fd) {
             return std::nullopt;
         }
         if (ch == '\n') break;
+        if (buf.size() >= 65536) return std::nullopt;
         buf.push_back(ch);
     }
     return buf;
@@ -256,6 +277,9 @@ static void event_loop(HyprState* state) {
         state->eventFd.store(fd);
         backoffMs = backoffStartMs;
 
+        { std::lock_guard<std::mutex> lock(g_queueMutex);
+          if (g_eventQueue.size() >= maxQueueSize) g_eventQueue.pop();
+          g_eventQueue.push(EventItem{"connection", "connected"}); }
         // Read lines as events
         while (g_running.load()) {
             auto lineOpt = read_line(fd);
@@ -276,6 +300,11 @@ static void event_loop(HyprState* state) {
         }
         state->eventFd.store(-1);
         ::close(fd);
+        if (g_running.load()) {
+            std::lock_guard<std::mutex> lock(g_queueMutex);
+            if (g_eventQueue.size() >= maxQueueSize) g_eventQueue.pop();
+            g_eventQueue.push(EventItem{"connection", "disconnected"});
+        }
     }
     hyprState = nullptr;
 }
@@ -397,7 +426,8 @@ static void dispatch_events(JSContext* ctx) {
         {
             std::lock_guard<std::mutex> lk(g_subMutex);
             auto it = g_subscribers.find(ev.name);
-            if (it != g_subscribers.end()) subs = it->second; // copy for reentrancy safety
+            if (it != g_subscribers.end()) for (const auto &callback : it->second)
+                subs.push_back(JsCallback{callback.ctx, JS_DupValue(ctx, callback.func)});
         }
         if (subs.empty()) continue;
 
@@ -410,6 +440,7 @@ static void dispatch_events(JSContext* ctx) {
             JSValue arg = JS_DupValue(ctx, obj);
             call_js_and_catch(ctx, c.func, 1, &arg);
             JS_FreeValue(ctx, arg);
+            JS_FreeValue(ctx, c.func);
         }
         JS_FreeValue(ctx, obj);
     }
@@ -485,29 +516,33 @@ static void hypr_update_callback(void* /*data*/) {
     if (!completed.empty()) {
         std::lock_guard<std::mutex> lk(g_promisesMutex);
         for (auto& r : completed) {
+            auto worker = hyprState->jobThreads.find(r.id);
+            if (worker != hyprState->jobThreads.end()) { worker->second.join(); hyprState->jobThreads.erase(worker); }
             auto it = g_promises.find(r.id);
             if (it == g_promises.end()) continue;
             auto pend = it->second;
             g_promises.erase(it);
             if (!r.success) {
                 JSValue err = JS_NewString(g_ctx, "Hypr IPC command failed");
-                JS_Call(g_ctx, pend.reject, JS_UNDEFINED, 1, &err);
+                JSValue returned = JS_Call(g_ctx, pend.reject, JS_UNDEFINED, 1, &err);
+                JS_FreeValue(g_ctx, returned);
                 JS_FreeValue(g_ctx, err);
             } else {
                 if (pend.type == JobType::Json) {
                     JSValue parsed = JS_ParseJSON(g_ctx, r.payload.c_str(), r.payload.size(), "hypr-json");
                     if (JS_IsException(parsed)) {
-                        // fallback to string
-                        JSValue s = JS_NewString(g_ctx, r.payload.c_str());
-                        JS_Call(g_ctx, pend.resolve, JS_UNDEFINED, 1, &s);
-                        JS_FreeValue(g_ctx, s);
+                        JSValue error = JS_GetException(g_ctx);
+                        JSValue returned = JS_Call(g_ctx, pend.reject, JS_UNDEFINED, 1, &error);
+                        JS_FreeValue(g_ctx, returned); JS_FreeValue(g_ctx, error);
                     } else {
-                        JS_Call(g_ctx, pend.resolve, JS_UNDEFINED, 1, &parsed);
+                        JSValue returned = JS_Call(g_ctx, pend.resolve, JS_UNDEFINED, 1, &parsed);
+                        JS_FreeValue(g_ctx, returned);
                         JS_FreeValue(g_ctx, parsed);
                     }
                 } else {
                     JSValue s = JS_NewString(g_ctx, r.payload.c_str());
-                    JS_Call(g_ctx, pend.resolve, JS_UNDEFINED, 1, &s);
+                    JSValue returned = JS_Call(g_ctx, pend.resolve, JS_UNDEFINED, 1, &s);
+                    JS_FreeValue(g_ctx, returned);
                     JS_FreeValue(g_ctx, s);
                 }
             }
@@ -530,7 +565,7 @@ static void hypr_shutdown(HyprState* state) {
     }
     if (g_eventThread.joinable()) g_eventThread.join();
     for (auto& worker : state->jobThreads) {
-        if (worker.joinable()) worker.join();
+        if (worker.second.joinable()) worker.second.join();
     }
     state->jobThreads.clear();
     {
@@ -560,20 +595,32 @@ static void hypr_shutdown(HyprState* state) {
     hyprState = nullptr;
 }
 
+static std::mutex ownersMutex;
+static std::map<JSModuleDef *, HyprState *> owners;
+struct Binding { const char *name; JSCFunction *function; int length; };
+static const Binding bindings[] = {
+    {"connect", js_connect, 1}, {"on", js_on, 2}, {"off", js_off, 2},
+    {"send", js_send, 1}, {"json", js_json, 2}, {"workspaces", js_workspaces, 0},
+    {"monitors", js_monitors, 0}, {"clients", js_clients, 0},
+    {"activeworkspace", js_activeworkspace, 0}, {"activewindow", js_activewindow, 0},
+    {"version", js_version, 0}, {"getOption", js_getoption, 1}
+};
 static int hypr_module_init(JSContext* ctx, JSModuleDef* m) {
-    JS_SetModuleExport(ctx, m, "connect", JS_NewCFunction(ctx, js_connect, "connect", 1));
-    JS_SetModuleExport(ctx, m, "on", JS_NewCFunction(ctx, js_on, "on", 2));
-    JS_SetModuleExport(ctx, m, "off", JS_NewCFunction(ctx, js_off, "off", 2));
-    JS_SetModuleExport(ctx, m, "send", JS_NewCFunction(ctx, js_send, "send", 1));
-    JS_SetModuleExport(ctx, m, "json", JS_NewCFunction(ctx, js_json, "json", 2));
-    // Convenience wrappers matching Waybar/commonly used queries
-    JS_SetModuleExport(ctx, m, "workspaces", JS_NewCFunction(ctx, js_workspaces, "workspaces", 0));
-    JS_SetModuleExport(ctx, m, "monitors", JS_NewCFunction(ctx, js_monitors, "monitors", 0));
-    JS_SetModuleExport(ctx, m, "clients", JS_NewCFunction(ctx, js_clients, "clients", 0));
-    JS_SetModuleExport(ctx, m, "activeworkspace", JS_NewCFunction(ctx, js_activeworkspace, "activeworkspace", 0));
-    JS_SetModuleExport(ctx, m, "activewindow", JS_NewCFunction(ctx, js_activewindow, "activewindow", 0));
-    JS_SetModuleExport(ctx, m, "version", JS_NewCFunction(ctx, js_version, "version", 0));
-    JS_SetModuleExport(ctx, m, "getOption", JS_NewCFunction(ctx, js_getoption, "getOption", 1));
+    HyprState *state;
+    { std::lock_guard<std::mutex> lock(ownersMutex); state = owners.at(m); }
+    for (int i = 0; i < static_cast<int>(sizeof(bindings) / sizeof(bindings[0])); ++i) {
+        JSValue data[] = {JS_NewBigInt64(ctx, reinterpret_cast<intptr_t>(state))};
+        JSValue function = JS_NewCFunctionData(ctx, [](JSContext *ctx, JSValueConst receiver, int argc, JSValueConst *argv, int index, JSValue *data) {
+            int64_t pointer = 0;
+            if (JS_ToBigInt64(ctx, &pointer, data[0]) < 0) return JS_EXCEPTION;
+            HyprState *previous = hyprState;
+            hyprState = reinterpret_cast<HyprState *>(static_cast<intptr_t>(pointer));
+            JSValue result = hyprState->stopping.load() ? JS_ThrowInternalError(ctx, "Compositor module is stopped") : bindings[index].function(ctx, receiver, argc, argv);
+            hyprState = previous;
+            return result;
+        }, bindings[i].length, i, 1, data);
+        JS_FreeValue(ctx, data[0]); JS_SetModuleExport(ctx, m, bindings[i].name, function);
+    }
     return 0;
 }
 
@@ -593,22 +640,16 @@ HELIX_PLUGIN_EXPORT int helix_plugin_integrate(JSContext* ctx, const char* modul
     };
     JSModuleDef* m = JS_NewCModule(ctx, module_name, hypr_module_init);
     if (!m) { hypr_shutdown(&owner->runtime); delete owner; return 1; }
-    JS_AddModuleExport(ctx, m, "connect");
-    JS_AddModuleExport(ctx, m, "on");
-    JS_AddModuleExport(ctx, m, "off");
-    JS_AddModuleExport(ctx, m, "send");
-    JS_AddModuleExport(ctx, m, "json");
-    JS_AddModuleExport(ctx, m, "workspaces");
-    JS_AddModuleExport(ctx, m, "monitors");
-    JS_AddModuleExport(ctx, m, "clients");
-    JS_AddModuleExport(ctx, m, "activeworkspace");
-    JS_AddModuleExport(ctx, m, "activewindow");
-    JS_AddModuleExport(ctx, m, "version");
-    JS_AddModuleExport(ctx, m, "getOption");
+    { std::lock_guard<std::mutex> lock(ownersMutex); owners[m] = &owner->runtime; }
+    for (const auto &binding : bindings) JS_AddModuleExport(ctx, m, binding.name);
     owner->instance.abiVersion = HELIX_PLUGIN_ABI_VERSION;
     owner->instance.module = m;
     owner->instance.state = owner;
-    owner->instance.destroy = [](void* state) { delete static_cast<HyprPlugin*>(state); };
+    owner->instance.destroy = [](void* state) {
+        auto *owner = static_cast<HyprPlugin *>(state);
+        { std::lock_guard<std::mutex> lock(ownersMutex); owners.erase(owner->instance.module); }
+        delete owner;
+    };
     *out = &owner->instance;
     return 0;
 }

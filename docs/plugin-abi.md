@@ -30,6 +30,12 @@ are `helix.script`, `helix.assets`, and `helix.render`. Consumers may expose
 additional namespaced capabilities without revising the core ABI. Capability
 pointers are runtime-bound and must not be used after script shutdown begins.
 
+The current plugin ABI is version 2. The `helix.render` capability is
+`HelixRenderCapabilityV2`; request version 2 when discovering it. Its
+`schedule` function runs accepted work on the process thread, then invokes
+exactly one completion or cancellation callback on the originating script
+thread. On rejection it returns zero and leaves ownership with the caller.
+
 ## Threading and teardown
 
 - `scriptUpdate` runs on the QuickJS owner thread and receives a copied timing payload.

@@ -14,6 +14,7 @@ struct PluginServices
     int (*request_window_render)(void*, unsigned int) = nullptr;
     int (*set_renderable_shader_paths)(void*, unsigned int, unsigned int, const char*, const char*, int) = nullptr;
     int (*set_ui_shader_paths)(void*, unsigned int, int, const char*, const char*, int) = nullptr;
+    int (*enqueue_render_task)(void*, HelixPluginTask, HelixPluginTask, HelixPluginTask, void*) = nullptr;
     int (*enqueue_script_thread_task)(void*, HelixPluginTask, void*) = nullptr;
 };
 
@@ -23,14 +24,14 @@ struct HelixPluginSupport
     PluginServices services{};
     const HelixScriptCapabilityV1* script = nullptr;
     const HelixAssetsCapabilityV1* assets = nullptr;
-    const HelixRenderCapabilityV1* render = nullptr;
+    const HelixRenderCapabilityV2* render = nullptr;
 
     bool initialize (const HelixPluginHost* host)
     {
         if(!host || host->abiVersion != HELIX_PLUGIN_ABI_VERSION || !host->findCapability) return false;
         script = static_cast<const HelixScriptCapabilityV1*>(host->findCapability(host->context, HELIX_PLUGIN_CAPABILITY_SCRIPT, 1));
         assets = static_cast<const HelixAssetsCapabilityV1*>(host->findCapability(host->context, HELIX_PLUGIN_CAPABILITY_ASSETS, 1));
-        render = static_cast<const HelixRenderCapabilityV1*>(host->findCapability(host->context, HELIX_PLUGIN_CAPABILITY_RENDER, 1));
+        render = static_cast<const HelixRenderCapabilityV2*>(host->findCapability(host->context, HELIX_PLUGIN_CAPABILITY_RENDER, 2));
         services.ctx = this;
         services.create_texture_rgba = &createTexture;
         services.update_texture_rgba = &updateTexture;
@@ -42,6 +43,7 @@ struct HelixPluginSupport
         services.set_renderable_shader_paths = &setRenderableShaders;
         services.set_ui_shader_paths = &setUiShaders;
         services.enqueue_script_thread_task = &schedule;
+        services.enqueue_render_task = &scheduleRender;
         return script != nullptr;
     }
 
@@ -50,6 +52,11 @@ struct HelixPluginSupport
     {
         auto* owner = self(context);
         return owner && owner->script ? owner->script->schedule(owner->script->context, task, data) : 0;
+    }
+    static int scheduleRender (void* context, HelixPluginTask work, HelixPluginTask completed, HelixPluginTask cancelled, void* data)
+    {
+        auto* owner = self(context);
+        return owner && owner->render ? owner->render->schedule(owner->render->context, work, completed, cancelled, data) : 0;
     }
     static int resolveTemporaryFile (void* context, const char* path, char* output, size_t capacity)
     {

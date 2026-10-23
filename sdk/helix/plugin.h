@@ -11,7 +11,7 @@ extern "C" {
 typedef struct JSContext JSContext;
 typedef struct JSModuleDef JSModuleDef;
 
-#define HELIX_PLUGIN_ABI_VERSION 1u
+#define HELIX_PLUGIN_ABI_VERSION 2u
 #define HELIX_PLUGIN_CAPABILITY_SCRIPT "helix.script"
 #define HELIX_PLUGIN_CAPABILITY_ASSETS "helix.assets"
 #define HELIX_PLUGIN_CAPABILITY_RENDER "helix.render"
@@ -55,7 +55,7 @@ enum {
     HELIX_RENDER_TEXTURE_DATA_LINEAR_NO_PREMUL = 1
 };
 
-typedef struct HelixRenderCapabilityV1 {
+typedef struct HelixRenderCapabilityV2 {
     uint32_t version;
     void* context;
     int (*createTextureRgba)(void* context, uint32_t windowId, const char* key, int width, int height, int mipmaps, int textureSemantic);
@@ -66,7 +66,11 @@ typedef struct HelixRenderCapabilityV1 {
     int (*setRenderableShaderPaths)(void* context, uint32_t windowId, uint32_t renderableHandle, const char* vertexPath, const char* fragmentPath,
                                     int blendMode);
     int (*setUiShaderPaths)(void* context, uint32_t windowId, int elementId, const char* vertexPath, const char* fragmentPath, int blendMode);
-} HelixRenderCapabilityV1;
+    /* Accepted work runs on the process thread; exactly one terminal callback
+       runs on the originating script thread. Data must remain owned until then.
+       A rejected submission returns zero and retains ownership with the caller. */
+    int (*schedule)(void* context, HelixPluginTask work, HelixPluginTask completed, HelixPluginTask cancelled, void* data);
+} HelixRenderCapabilityV2;
 
 typedef struct HelixPluginHost {
     uint32_t abiVersion;

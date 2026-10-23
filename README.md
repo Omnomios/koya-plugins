@@ -11,7 +11,7 @@ script-thread callbacks, and resource cleanup.
 
 | Plugin | What it provides | Development dependencies |
 | --- | --- | --- |
-| `dbus` | DBus connections, method calls, and signals | `dbus-1` |
+| `dbus` | DBus connections, method calls, signals, and service exports | `dbus-1` |
 | `ffmpeg` | Video decoding and frame delivery to engine textures | `libavformat`, `libavcodec`, `libavutil`, `libswscale` |
 | `http` | Asynchronous HTTP(S) requests and binary responses | OpenSSL for HTTPS on Unix; WinHTTP and Winsock on Windows |
 | `hypr` | Hyprland IPC events, commands, and queries | Unix sockets; Unix only |

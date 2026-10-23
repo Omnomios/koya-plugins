@@ -72,8 +72,8 @@ if 'dbus' in plugin_selection
     )
     test(
       'hx-dbus-regression',
-      find_program('python3'),
-      args: [files('tests/run_dbus_regression.py'), find_program('dbus-daemon').full_path(), dbus_regression],
+      find_program('bash'),
+      args: [files('tests/run_dbus_regression.sh'), find_program('dbus-daemon').full_path(), dbus_regression],
       timeout: 40,
     )
   endif
@@ -140,6 +140,17 @@ if 'hypr' in plugin_selection
   )
   plugin_test_names += ['hypr']
   plugin_test_targets += [hypr_plugin]
+  # The standalone regression harness needs matching QuickJS symbols of its own.
+  if quickjs_library != '' and not meson.is_cross_build()
+    hypr_regression = executable(
+      'helix_hypr_regression',
+      files('tests/hypr_regression.cpp'),
+      link_with: hypr_plugin,
+      include_directories: plugin_inc,
+      dependencies: plugin_common_deps + [cpp.find_library('m')],
+    )
+    test('hx-hypr-regression', hypr_regression, timeout: 20)
+  endif
 endif
 
 if 'pam' in plugin_selection

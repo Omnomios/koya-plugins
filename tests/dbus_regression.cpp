@@ -247,7 +247,7 @@ int main() {
                 assert(await call('GetText') === '{literal text}', 'JSON-looking string stays string');
                 let error;
                 try { await call('Fail'); } catch(e) { error = e; }
-                assert(error === 'ERROR:org.example.Failure', 'error reply');
+                assert(error === 'ERROR:org.example.Failure: expected', 'error reply');
                 const complex = await system.callComplex('org.example.HelixTest','/org/example/Test','org.example.HelixTest','GetSettings','');
                 assert(complex['802-11-wireless'].Strength === 73, 'complex call decoder');
                 for (const [bus, received] of [[session,sessionSignals],[system,systemSignals]]) {
@@ -294,6 +294,102 @@ int main() {
                 .catch(e => globalThis.failure = String(e));
         )JS");
         wait(second, session, system, "done", &first);
+        // Exercise service export through the existing two independent runtimes.
+        eval(second.ctx, R"JS(
+            globalThis.assert = (ok, message) => { if (!ok) throw new Error(message); };
+            globalThis.serviceReady = false;
+            globalThis.held = null;
+            for (const destination of ['', 'invalid', 'org..invalid']) {
+                let invalid = false;
+                try { DBus.session.emitSignalTo(destination, '/org/example/Export', 'org.example.Export', 'Directed', ''); } catch(e) { invalid = true; }
+                assert(invalid, 'invalid signal destination');
+            }
+            DBus.session.exportObject('/org/example/Export', 'org.example.Export', call => {
+                assert(call.sender.startsWith(':'), 'service sender identity');
+                if (call.member === 'Echo') {
+                    assert(call.signature === 'a{sv}as', 'incoming signature');
+                    assert(call.args[0].Strength === 255, 'typed incoming dictionary');
+                    call.reply('a{sv}as', {Quality: {_t: '(ub)', _v: [90, false]}, Bytes: {_t: 'ay', _v: []}}, call.args[1]);
+                } else if (call.member === 'Tree') {
+                    call.reply('a{oa{sa{sv}}}', {'/org/example/Export': {'org.example.Export': {Paths: {_t: 'ao', _v: ['/org/example/Export']}}}});
+                } else if (call.member === 'Fail') {
+                    call.error('org.example.Rejected', 'expected rejection');
+                } else if (call.member === 'Throw') {
+                    throw new Error('handler failure');
+                } else if (call.member === 'Hold') {
+                    globalThis.held = call;
+                } else if (call.member === 'Emit') {
+                    DBus.session.emitSignal(call.path, call.interface, 'Changed', 'sa{sv}as', 'org.example.Export', {Strength: {_t: 'y', _v: 22}}, []);
+                    call.reply('');
+                } else if (call.member === 'EmitDirected') {
+                    DBus.session.emitSignalTo(call.args[0] || call.sender, call.path, call.interface, 'Directed', 's', 'private');
+                    call.reply('');
+                } else if (call.member === 'Invalid') {
+                    let bad = false;
+                    try { call.reply('y', 256); } catch(e) { bad = true; }
+                    assert(bad, 'invalid reply guarded');
+                    call.reply('s', 'recovered');
+                    let duplicate = false;
+                    try { call.reply(''); } catch(e) { duplicate = true; }
+                    assert(duplicate, 'single completion');
+                } else call.error('org.freedesktop.DBus.Error.UnknownMethod', call.member);
+            });
+            DBus.session.call('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'RequestName', 'su', 'org.example.Exported', 4)
+                .then(result => { assert(result === '1', 'service name ownership'); globalThis.serviceReady = true; })
+                .catch(e => globalThis.failure = String(e));
+        )JS");
+        wait(second, session, system, "serviceReady", &first);
+        eval(first.ctx, R"JS(
+            globalThis.exportDone = false; globalThis.exportSignals = [];
+            (async () => {
+                const bus = DBus.session;
+                const call = (method, sig = '', ...args) => bus.callComplex('org.example.Exported', '/org/example/Export', 'org.example.Export', method, sig, ...args);
+                const reply = await call('Echo', 'a{sv}as', {Strength: {_t: 'y', _v: 255}}, ['one', 'two']);
+                assert(JSON.stringify(reply.Quality) === '[90,false]' && reply.Bytes.length === 0, 'typed reply containers');
+                const tree = await call('Tree');
+                assert(tree['/org/example/Export']['org.example.Export'].Paths[0] === '/org/example/Export', 'object manager tree');
+                for (const [method, expected] of [['Fail','org.example.Rejected'], ['Throw','org.freedesktop.DBus.Error.Failed'], ['Missing','org.freedesktop.DBus.Error.UnknownMethod']]) {
+                    let error; try { await call(method); } catch(e) { error = e; }
+                    assert(error.startsWith('ERROR:' + expected + ': '), 'service error ' + method);
+                }
+                assert(await call('Invalid') === 'recovered', 'retry invalid reply');
+                bus.addMatch("type='signal',interface='org.example.Export'");
+                bus.onSignal(sig => { if (sig.interface === 'org.example.Export') exportSignals.push(sig); });
+                await bus.call('org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','GetId');
+                await call('Emit');
+                globalThis.observerSignals = [];
+                DBus.addMatch("type='signal',interface='org.example.Export',member='Directed'");
+                DBus.onSignal(sig => { if (sig.member === 'Directed') observerSignals.push(sig); });
+                await DBus.call('org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','GetId');
+                await call('EmitDirected', 's', '');
+                await bus.call('org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','RequestName', 'su', 'org.example.SignalClient', 4);
+                await call('EmitDirected', 's', 'org.example.SignalClient');
+                globalThis.exportDone = true;
+                globalThis.heldDone = false;
+                call('Hold').then(value => { assert(value === 'later', 'async service reply'); heldDone = true; }).catch(e => globalThis.failure = String(e));
+            })().catch(e => globalThis.failure = String(e));
+        )JS");
+        wait(first, session, system, "exportDone && exportSignals.length === 3", &second);
+        wait(second, session, system, "held !== null", &first);
+        eval(second.ctx, "held.reply('s', 'later'); held = null;");
+        wait(first, session, system, "heldDone", &second);
+        eval(first.ctx, R"JS(
+            assert(observerSignals.length === 0, 'directed signals leaked to another matched connection');
+            assert(exportSignals.slice(1).every(sig => sig.sender === exportSignals[0].sender && sig.args[0] === 'private'), 'directed signal sender or payload');
+            assert(exportSignals[0].args[1].Strength === 22 && exportSignals[0].args[2].length === 0, 'exported signal');
+            globalThis.removedDone = false;
+            DBus.session.call('org.example.Exported','/org/example/Export','org.example.Export','Hold')
+                .then(() => globalThis.failure = 'unexport should reject pending call')
+                .catch(e => { assert(e === 'ERROR:org.freedesktop.DBus.Error.UnknownObject: Object interface unexported', 'unexport error'); removedDone = true; });
+        )JS");
+        wait(second, session, system, "held !== null", &first);
+        eval(second.ctx, R"JS(
+            DBus.session.unexportObject('/org/example/Export', 'org.example.Export');
+            let stale = false; try { held.reply(''); } catch(e) { stale = true; }
+            assert(stale, 'unexport invalidates delayed completion');
+        )JS");
+        wait(first, session, system, "removedDone", &second);
+
         first.plugin->scriptShutdown(first.plugin->state);
         eval(first.ctx, "let closed=false; try { DBus.session.connect(); } catch(e) { closed=true; } assert(closed, 'shutdown guard');");
         eval(second.ctx, R"JS(

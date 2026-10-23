@@ -81,39 +81,40 @@ struct PamPlugin : HelixPluginSupport {
     PamState runtime;
 };
 
-static int conv_func(int num_msg, const struct pam_message** msg, struct pam_response** resp, void* appdata_ptr)
+static void erase_password(std::string& password) {
+    volatile char* bytes = password.data();
+    for (size_t i = 0; i < password.size(); ++i) bytes[i] = 0;
+    password.clear();
+}
+
+static int conv_func(int count, const pam_message** messages, pam_response** out, void* data)
 {
-    if (!resp || !appdata_ptr) return PAM_CONV_ERR;
-    const char* password = static_cast<const char*>(appdata_ptr);
-    struct pam_response* replies = static_cast<struct pam_response*>(calloc((size_t)num_msg, sizeof(struct pam_response)));
+    if (!out || !data || !messages || count < 1 || count > PAM_MAX_NUM_MSG) return PAM_CONV_ERR;
+    auto& request = *static_cast<AuthRequest*>(data);
+    auto* replies = static_cast<pam_response*>(calloc(count, sizeof(pam_response)));
     if (!replies) return PAM_BUF_ERR;
-    for (int i = 0; i < num_msg; ++i) {
-        replies[i].resp_retcode = 0;
-        replies[i].resp = nullptr;
-        switch (msg[i]->msg_style) {
-            case PAM_PROMPT_ECHO_OFF: {
-                if (password) {
-                    replies[i].resp = strdup(password);
-                }
-                break;
-            }
-            case PAM_PROMPT_ECHO_ON: {
-                // Not expected; return empty
-                replies[i].resp = strdup("");
-                break;
-            }
-            case PAM_ERROR_MSG:
-            case PAM_TEXT_INFO: {
-                // No response needed
-                break;
-            }
-            default: {
-                free(replies);
-                return PAM_CONV_ERR;
-            }
+    const auto fail = [&](int code) {
+        for (int i = 0; i < count; ++i) if (replies[i].resp) {
+            volatile char* bytes = replies[i].resp;
+            for (size_t j = 0, length = strlen(replies[i].resp); j < length; ++j) bytes[j] = 0;
+            free(replies[i].resp);
         }
+        free(replies);
+        return code;
+    };
+    for (int i = 0; i < count; ++i) {
+        if (!messages[i]) return fail(PAM_CONV_ERR);
+        const char* value = nullptr;
+        switch (messages[i]->msg_style) {
+            case PAM_PROMPT_ECHO_OFF: value = request.password.c_str(); break;
+            case PAM_PROMPT_ECHO_ON: value = request.user.c_str(); break;
+            case PAM_ERROR_MSG:
+            case PAM_TEXT_INFO: break;
+            default: return fail(PAM_CONV_ERR);
+        }
+        if (value && !(replies[i].resp = strdup(value))) return fail(PAM_BUF_ERR);
     }
-    *resp = replies;
+    *out = replies;
     return PAM_SUCCESS;
 }
 
@@ -132,12 +133,12 @@ static void worker_loop(PamState* state)
 
         // Perform PAM conversation
         pam_handle_t* pamh = nullptr;
-        struct pam_conv conv { conv_func, (void*)req.password.c_str() };
+        struct pam_conv conv { conv_func, &req };
         int rc = pam_start(req.service.c_str(), req.user.c_str(), &conv, &pamh);
         int finalCode = rc;
         std::string message;
         if (rc == PAM_SUCCESS) {
-            rc = pam_authenticate(pamh, 0);
+            rc = pam_authenticate(pamh, PAM_DISALLOW_NULL_AUTHTOK);
             finalCode = rc;
             if (rc == PAM_SUCCESS) {
                 rc = pam_acct_mgmt(pamh, 0);
@@ -147,6 +148,7 @@ static void worker_loop(PamState* state)
         if (pamh) {
             pam_end(pamh, finalCode);
         }
+        erase_password(req.password);
         bool ok = (finalCode == PAM_SUCCESS);
         if (!ok) {
             const char* s = pam_strerror(nullptr, finalCode);
@@ -162,8 +164,9 @@ static void worker_loop(PamState* state)
 }
 
 static std::string js_to_string(JSContext* ctx, JSValueConst v) {
-    const char* c = JS_ToCString(ctx, v);
-    std::string s = c ? c : "";
+    size_t length = 0;
+    const char* c = JS_ToCStringLen(ctx, &length, v);
+    std::string s = c ? std::string(c, length) : "";
     if (c) JS_FreeCString(ctx, c);
     return s;
 }
@@ -183,7 +186,15 @@ static JSValue js_authenticate(JSContext* ctx, JSValueConst this_val, int argc, 
     v = JS_GetPropertyStr(ctx, argv[0], "password");
     std::string password = js_to_string(ctx, v);
     JS_FreeValue(ctx, v);
-    if (user.empty()) return JS_ThrowTypeError(ctx, "authenticate: 'user' is required");
+    if (service.empty() || user.empty() ||
+        service.find('\0') != std::string::npos || user.find('\0') != std::string::npos || password.find('\0') != std::string::npos) {
+        erase_password(password);
+        return JS_ThrowTypeError(ctx, "authenticate: invalid service, user or password");
+    }
+    if (g_promises.size() >= 16) {
+        erase_password(password);
+        return JS_ThrowInternalError(ctx, "authenticate: too many pending requests");
+    }
 
     JSValue funcs[2];
     JSValue promise = JS_NewPromiseCapability(ctx, funcs);
@@ -261,7 +272,7 @@ static void pam_shutdown(PamState* state)
     }
     {
         std::lock_guard<std::mutex> lk(g_reqMutex);
-        while (!g_requests.empty()) g_requests.pop();
+        while (!g_requests.empty()) { erase_password(g_requests.front().password); g_requests.pop(); }
     }
     g_ctx = nullptr;
     pamState = nullptr;

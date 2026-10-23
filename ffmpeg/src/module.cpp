@@ -11,10 +11,12 @@
 */
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <map>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <vector>
 #include <queue>
@@ -70,17 +72,51 @@ struct VideoStream {
     double startEngineTime = std::numeric_limits<double>::quiet_NaN();
 
     // Playback clock
+    std::mutex clockMutex;
     std::chrono::steady_clock::time_point startTp;
     std::chrono::steady_clock::time_point pauseTp;
     double pausedAccumSec = 0.0;
 };
+
+struct RenderRequest
+{
+    int result = 0;
+    PluginServices services;
+    uint32_t windowId = 0;
+    std::string key;
+    int width = 0;
+    int height = 0;
+};
+
+static void execute_render_request (void* data)
+{
+    auto& request = *static_cast<RenderRequest*>(data);
+    if(request.width > 0)
+        request.result = request.services.create_texture_rgba(request.services.ctx, request.windowId, request.key.c_str(), request.width, request.height, 0,
+                                             HELIX_RENDER_TEXTURE_COLOR_SRGB_PREMUL);
+    else
+        request.result = request.services.request_window_render(request.services.ctx, request.windowId);
+}
+
+static void release_render_request (void* data)
+{
+    delete static_cast<RenderRequest*>(data);
+}
+
+static void complete_render_request (void* data)
+{
+    const auto& request = *static_cast<RenderRequest*>(data);
+    if(request.width > 0 && request.result <= 0)
+        std::fprintf(stderr, "[ffmpeg] texture creation failed window=%u key=%s\n", request.windowId, request.key.c_str());
+    release_render_request(data);
+}
 
 struct FfmpegState
 {
     JSContext* context = nullptr;
     const PluginServices* renderer = nullptr;
     std::mutex mutex;
-    std::map<std::string, std::unique_ptr<VideoStream>> streams;
+    std::map<std::string, std::shared_ptr<VideoStream>> streams;
 };
 
 struct FfmpegPlugin : HelixPluginSupport { FfmpegState state; };
@@ -159,13 +195,13 @@ static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
     }
 
     // Allocate and open
-    auto vs = std::make_unique<VideoStream>();
+    auto vs = std::make_shared<VideoStream>();
     vs->services = g_renderer;
     vs->windowId = windowId;
     vs->key = k;
     JS_FreeCString(ctx, k);
 
-    if(!g_renderer || !g_renderer->create_texture_rgba || !g_renderer->update_texture_rgba)
+    if(!g_renderer || !g_renderer->create_texture_rgba || !g_renderer->update_texture_rgba || !g_renderer->enqueue_render_task)
     { JS_FreeCString(ctx, vpath); return JS_ThrowInternalError(ctx, "renderer services unavailable"); }
 
     // Prefer in-memory IO via custom AVIO if available; fall back to temp file if needed.
@@ -257,10 +293,16 @@ static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
     if(vs->avgFps < 1.0) vs->avgFps = 30.0;
     vs->frameDurationSec = 1.0 / vs->avgFps;
 
-    // Create texture
-    int ok = g_renderer->create_texture_rgba((void*)g_renderer->ctx, windowId, vs->key.c_str(), vs->width, vs->height, 0,
-                                             HELIX_RENDER_TEXTURE_COLOR_SRGB_PREMUL);
-    if(!ok) return JS_ThrowInternalError(ctx, "create_texture_rgba failed");
+    auto textureRequest = std::make_unique<RenderRequest>();
+    textureRequest->services = *g_renderer;
+    textureRequest->windowId = windowId;
+    textureRequest->key = vs->key;
+    textureRequest->width = vs->width;
+    textureRequest->height = vs->height;
+    if(!g_renderer->enqueue_render_task(g_renderer->ctx, &execute_render_request, &complete_render_request,
+                                        &release_render_request, textureRequest.get()))
+        return JS_ThrowInternalError(ctx, "renderer is closing");
+    textureRequest.release();
 
     vs->running.store(true);
     vs->playing.store(true);
@@ -284,10 +326,12 @@ static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
                 // Loop: reset timing baseline so the next iteration starts fresh
                 s->firstPtsSec = std::numeric_limits<double>::quiet_NaN();
                 s->nextDueSec = 0.0;
-                s->startTp = std::chrono::steady_clock::now();
-                // Clear accumulated pause so new loop doesn't inherit previous pause time
-                s->pausedAccumSec = 0.0;
-                s->pauseTp = std::chrono::steady_clock::time_point{};
+                {
+                    std::lock_guard lock(s->clockMutex);
+                    s->startTp = std::chrono::steady_clock::now();
+                    s->pausedAccumSec = 0.0;
+                    s->pauseTp = std::chrono::steady_clock::time_point{};
+                }
                 // Seek to start and continue
                 av_seek_frame(s->fmt, s->videoStreamIndex, 0, AVSEEK_FLAG_BACKWARD);
                 continue;
@@ -295,7 +339,7 @@ static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
             if(pkt->stream_index != s->videoStreamIndex) { av_packet_unref(pkt); continue; }
             if(avcodec_send_packet(s->codec, pkt) >= 0)
             {
-                while(avcodec_receive_frame(s->codec, frm) >= 0)
+                while(s->running.load() && avcodec_receive_frame(s->codec, frm) >= 0)
                 {
                     sws_scale(s->sws, frm->data, frm->linesize, 0, s->height, rgb->data, rgb->linesize);
                     {
@@ -323,7 +367,12 @@ static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
                         // Wait until due (worker-side pacing) with fine-grained spin-sleep near target
                         for(;;)
                         {
-                            double nowRel = std::chrono::duration<double>(std::chrono::steady_clock::now() - s->startTp).count() - s->pausedAccumSec;
+                            if(!s->running.load()) break;
+                            double nowRel;
+                            {
+                                std::lock_guard lock(s->clockMutex);
+                                nowRel = std::chrono::duration<double>(std::chrono::steady_clock::now() - s->startTp).count() - s->pausedAccumSec;
+                            }
                             double remain = s->nextDueSec - nowRel;
                             if(remain <= 0.0) break;
                             if(remain > 0.008) // >8ms: coarse sleep in small chunks
@@ -352,7 +401,12 @@ static JSValue js_load(JSContext* ctx, JSValueConst this_val, int argc, JSValueC
                         }
                         if(s->services && s->services->request_window_render)
                         {
-                            int ok = s->services->request_window_render((void*)s->services->ctx, s->windowId);
+                            auto request = std::make_unique<RenderRequest>();
+                            request->services = *s->services;
+                            request->windowId = s->windowId;
+                            const int ok = s->services->enqueue_render_task(s->services->ctx, &execute_render_request,
+                                &complete_render_request, &release_render_request, request.get());
+                            if(ok) request.release();
                             if(!ok)
                             {
                                 // Window likely destroyed; stop decoding this stream
@@ -406,6 +460,7 @@ static JSValue js_play(JSContext* ctx, JSValueConst, int argc, JSValueConst* arg
     std::lock_guard<std::mutex> lk(g_mutex);
     auto it = g_streams.find(make_stream_id(windowId, k));
     if(it != g_streams.end()) {
+        std::lock_guard clockLock(it->second->clockMutex);
         if(!it->second->playing.load()) {
             auto now = std::chrono::steady_clock::now();
             if(it->second->pauseTp.time_since_epoch().count() != 0) {
@@ -425,6 +480,7 @@ static JSValue js_pause(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
     std::lock_guard<std::mutex> lk(g_mutex);
     auto it = g_streams.find(make_stream_id(windowId, k));
     if(it != g_streams.end()) {
+        std::lock_guard clockLock(it->second->clockMutex);
         it->second->playing.store(false);
         it->second->pauseTp = std::chrono::steady_clock::now();
     }
@@ -472,26 +528,18 @@ static void on_render_begin(void* data)
     const HelixPluginRenderBegin* rb = reinterpret_cast<const HelixPluginRenderBegin*>(data);
     if(!rb || !g_renderer) return;
     // Collect keys for this window
-    std::vector<std::string> keys;
+    std::vector<std::shared_ptr<VideoStream>> streams;
     {
-        std::lock_guard<std::mutex> lk(g_mutex);
-        for(const auto& kv : g_streams)
-        {
-            if(kv.second->windowId == rb->windowId && kv.second->running) keys.push_back(kv.first);
-        }
+        std::unique_lock lock(g_mutex, std::try_to_lock);
+        if(!lock.owns_lock()) return;
+        for(const auto& [key, stream] : g_streams)
+            if(stream->windowId == rb->windowId && stream->running.load()) streams.push_back(stream);
     }
-    const double slack = 0.0;
-    for(const auto& key : keys)
+    for(const auto& s : streams)
     {
-        VideoStream* s = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(g_mutex);
-            auto it = g_streams.find(key);
-            if(it == g_streams.end()) continue;
-            s = it->second.get();
-        }
-        if(!s || !s->playing.load()) continue;
-        std::lock_guard<std::mutex> lk2(s->qmutex);
+        if(!s->playing.load()) continue;
+        std::unique_lock frameLock(s->qmutex, std::try_to_lock);
+        if(!frameLock.owns_lock()) continue;
         const std::uint64_t v = s->latestVersion.load(std::memory_order_acquire);
         if(v == s->lastConsumedVersion || s->latestRgba.empty()) continue;
         g_renderer->update_texture_rgba((void*)g_renderer->ctx, s->windowId, s->key.c_str(), s->latestRgba.data(), s->width*4, s->width, s->height, 0,
@@ -525,7 +573,7 @@ HELIX_PLUGIN_EXPORT int helix_plugin_integrate(JSContext* ctx, const char* modul
         ffmpegState = &static_cast<FfmpegPlugin*>(opaque)->state;
         on_render_begin(const_cast<HelixPluginRenderBegin*>(render));
     };
-    owner->instance.engineShutdown = [](void* opaque) {
+    owner->instance.scriptShutdown = [](void* opaque) {
         ffmpegState = &static_cast<FfmpegPlugin*>(opaque)->state;
         ffmpeg_cleanup(nullptr);
     };
@@ -539,13 +587,13 @@ HELIX_PLUGIN_EXPORT int helix_plugin_integrate(JSContext* ctx, const char* modul
 static void ffmpeg_cleanup(void* /*data*/)
 {
     // Move the map out under lock to avoid holding the mutex while joining/closing
-    std::map<std::string, std::unique_ptr<VideoStream>> local;
+    std::map<std::string, std::shared_ptr<VideoStream>> local;
     {
         std::lock_guard<std::mutex> lk(g_mutex);
         local.swap(g_streams);
     }
     // Helper to stop and free a single stream
-    auto stop_stream = [] (std::unique_ptr<VideoStream>& s) {
+    auto stop_stream = [] (std::shared_ptr<VideoStream>& s) {
         if(!s) return;
         teardown_stream(s.get());
         s.reset();
